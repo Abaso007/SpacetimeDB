@@ -34,7 +34,7 @@ class Test:
 def comment_sql(sql: str):
     new = ""
     for x in sql.split("\n"):
-        new = new + "# " + x + "\n"
+        new = f"{new}# {x}" + "\n"
     return new
 
 # Patch the cases that are not supported or need some adjustments to run
@@ -49,38 +49,38 @@ def fix_sql(old_sql: str):
         footer = ""
 
     if 'octets' in sql_lower:
-        header = "# (UNSUPPORTED: issue 1) " + header
+        header = f"# (UNSUPPORTED: issue 1) {header}"
         sql = comment_sql(sql)
         footer = ""
     if 'characters' in sql_lower:
-        header = "# (UNSUPPORTED: issue 1) " + header
+        header = f"# (UNSUPPORTED: issue 1) {header}"
         sql = comment_sql(sql)
         footer = ""
     if 'char varing' in sql_lower:
-        header = "# (UNSUPPORTED: issue 2) " + header
+        header = f"# (UNSUPPORTED: issue 2) {header}"
         sql = comment_sql(sql)
         footer = ""
     if 'as ( c , d )' in sql_lower:
-        header = "# (UNSUPPORTED: issue 3) " + header
+        header = f"# (UNSUPPORTED: issue 3) {header}"
         sql = comment_sql(sql)
         footer = ""
-    if 'current_time' in sql_lower and not('current_timestamp' in sql_lower):
+    if 'current_time' in sql_lower and 'current_timestamp' not in sql_lower:
         header = "# (REPLACED: issue 4)\n" + header
-        sql = sql.replace("CURRENT_TIME", "CURRENT_TIMESTAMP") 
+        sql = sql.replace("CURRENT_TIME", "CURRENT_TIMESTAMP")
     if 'when 2 , 2' in sql_lower:
-        header = "# (UNSUPPORTED: issue 5) " + header
+        header = f"# (UNSUPPORTED: issue 5) {header}"
         sql = comment_sql(sql)
         footer = ""
     if "( cast ( '01:02:03' as time ) as timestamp )" in sql_lower:
-        header = "# (WRONG: issue 6) " + header
+        header = f"# (WRONG: issue 6) {header}"
         sql = comment_sql(sql)
         footer = ""
     if 'default current_path' in sql_lower:
-         header = "skipif Postgres\n" + header
-         sql = sql + " --NOT_REWRITE"
+        header = "skipif Postgres\n" + header
+        sql = f"{sql} --NOT_REWRITE"
     if 'default system_user' in sql_lower:
-         header = "skipif Postgres\n" + header
-         sql = sql + " --NOT_REWRITE"
+        header = "skipif Postgres\n" + header
+        sql = f"{sql} --NOT_REWRITE"
     if 'schema' in sql_lower:
          header = "onlyif Postgres\n" + header
     if 'cursor' in sql_lower:
