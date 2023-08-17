@@ -80,16 +80,14 @@ def load_file(named: str):
 
 def print_cell(cell: str, size: int, is_last: bool):
     spaces = " " * (size - len(cell))
-    if is_last:
-        return "| %s%s |" % (cell, spaces)
-    else:
-        return "| %s%s " % (cell, spaces)
+    return f"| {cell}{spaces} |" if is_last else f"| {cell}{spaces} "
 
 
 def print_row(row: list, size: int):
-    line = ""
-    for (pos, x) in enumerate(row):
-        line += print_cell(str(x), size, pos + 1 == len(row))
+    line = "".join(
+        print_cell(str(x), size, pos + 1 == len(row))
+        for pos, x in enumerate(row)
+    )
     print(line)
 
 
@@ -100,7 +98,7 @@ def print_mkdown(report: Report):
     print("```\n")
     print("*Smaller is better.*")
     print_row(report.header, report.larger)
-    print_row(["-" * report.larger for x in report.header], report.larger)
+    print_row(["-" * report.larger for _ in report.header], report.larger)
 
     for row in report.rows:
         print_row(row, report.larger)
@@ -110,13 +108,12 @@ def pick_winner(a: dict, b: dict, label_a: str, label_b: str):
     if a["mean"] > b["mean"]:
         winner = label_b
         delta = a["times"]
+    elif a["mean"] == b["mean"]:
+        winner = "TIE"
+        delta = a["times"]
     else:
-        if a["mean"] == b["mean"]:
-            winner = "TIE"
-            delta = a["times"]
-        else:
-            winner = label_a
-            delta = b["times"]
+        winner = label_a
+        delta = b["times"]
     return winner, delta
 
 
@@ -126,12 +123,17 @@ def cmp_bench(stat: Stat):
 
     header = ["Stat", "Sqlite", "Spacetime", "Delta"]
 
-    rows = []
-    for (k, v) in stat.sqlite.items():
-        rows.append([k, v, stat.spacetime[k], round(stat.spacetime[k] - v, 2)])
-
+    rows = [
+        [k, v, stat.spacetime[k], round(stat.spacetime[k] - v, 2)]
+        for k, v in stat.sqlite.items()
+    ]
     bar = dict(SpaceTimeDb=stat.spacetime["mean"], Sqlite=stat.sqlite["mean"])
-    return Report("Comparing Sqlite VS Spacetime Winner: **%s**" % winner, header, bar, rows)
+    return Report(
+        f"Comparing Sqlite VS Spacetime Winner: **{winner}**",
+        header,
+        bar,
+        rows,
+    )
 
 
 # Check the progress of Spacetime between branches / PR
@@ -140,12 +142,14 @@ def improvement_bench(old: Stat, new: Stat):
 
     header = ["Stat", "OLD", "NEW", "Delta"]
 
-    rows = []
-    for (k, v) in old.spacetime.items():
-        rows.append([k, v, new.spacetime[k], round(v - new.spacetime[k], 2)])
-
+    rows = [
+        [k, v, new.spacetime[k], round(v - new.spacetime[k], 2)]
+        for k, v in old.spacetime.items()
+    ]
     bar = dict(Old=old.spacetime["mean"], New=new.spacetime["mean"])
-    return Report("Improvement of Spacetime. Winner: **%s**" % winner, header, bar, rows)
+    return Report(
+        f"Improvement of Spacetime. Winner: **{winner}**", header, bar, rows
+    )
 
 
 if __name__ == '__main__':
@@ -157,7 +161,7 @@ if __name__ == '__main__':
     # args = {"bench": "pr"}
     cmd = "./hyperfine.sh insert"
     if args["bench"] == "pr":
-        subprocess.check_call('./pr_copy.sh "%s"' % cmd, shell=True)
+        subprocess.check_call(f'./pr_copy.sh "{cmd}"', shell=True)
 
         subprocess.check_call(cmd, shell=True, timeout=60 * 5)
         shutil.copyfile("out.json", "new.json")
