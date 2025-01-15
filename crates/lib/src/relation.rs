@@ -1,164 +1,82 @@
-use std::collections::hash_map::DefaultHasher;
-use std::fmt;
-use std::hash::{Hash, Hasher};
-
-use crate::auth::{StAccess, StTableType};
-use crate::error::RelationError;
-use crate::table::ColumnDef;
+use crate::db::auth::{StAccess, StTableType};
+use crate::db::error::{RelationError, TypeError};
+use core::fmt;
+use core::hash::Hash;
+use derive_more::From;
+use spacetimedb_data_structures::map::HashSet;
+use spacetimedb_primitives::{ColId, ColList, ColSet, Constraints, TableId};
 use spacetimedb_sats::algebraic_value::AlgebraicValue;
-use spacetimedb_sats::product_value::ProductValue;
 use spacetimedb_sats::satn::Satn;
-use spacetimedb_sats::{algebraic_type, AlgebraicType, ProductType, ProductTypeElement, Typespace, WithTypespace};
+use spacetimedb_sats::{algebraic_type, AlgebraicType};
+use std::collections::BTreeMap;
+use std::sync::Arc;
 
-impl ColumnDef {
-    pub fn name(&self) -> FieldOnly {
-        if let Some(name) = &self.column.name {
-            FieldOnly::Name(name)
-        } else {
-            FieldOnly::Pos(self.pos)
-        }
-    }
-}
-
-pub fn calculate_hash<T: Hash>(t: &T) -> u64 {
-    let mut s = DefaultHasher::new();
-    t.hash(&mut s);
-    s.finish()
-}
-
-#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
-pub struct TableField<'a> {
-    pub table: Option<&'a str>,
-    pub field: &'a str,
-}
-
-pub fn extract_table_field(ident: &str) -> Result<TableField, RelationError> {
-    let parts: Vec<_> = ident.split('.').take(3).collect();
-
-    match parts[..] {
-        [table, field] => Ok(TableField {
-            table: Some(table),
-            field,
-        }),
-        [field] => Ok(TableField { table: None, field }),
-        _ => Err(RelationError::FieldPathInvalid(ident.to_string())),
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
-pub enum FieldOnly<'a> {
-    Name(&'a str),
-    Pos(usize),
-}
-
-impl fmt::Display for FieldOnly<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            FieldOnly::Name(x) => {
-                write!(f, "{x}")
-            }
-            FieldOnly::Pos(x) => {
-                write!(f, "{x}")
-            }
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
-pub enum FieldName {
-    Name { table: String, field: String },
-    Pos { table: String, field: usize },
+#[derive(Clone, Copy, PartialEq, PartialOrd, Eq, Ord, Hash)]
+pub struct FieldName {
+    pub table: TableId,
+    pub col: ColId,
 }
 
 impl FieldName {
-    pub fn named(table: &str, field: &str) -> Self {
-        Self::Name {
-            table: table.to_string(),
-            field: field.to_string(),
-        }
+    pub fn new(table: TableId, col: ColId) -> Self {
+        Self { table, col }
     }
 
-    pub fn positional(table: &str, field: usize) -> Self {
-        Self::Pos {
-            table: table.to_string(),
-            field,
-        }
+    pub fn table(&self) -> TableId {
+        self.table
     }
 
-    pub fn table(&self) -> &str {
-        match self {
-            FieldName::Name { table, .. } => table,
-            FieldName::Pos { table, .. } => table,
-        }
-    }
-
-    pub fn field(&self) -> FieldOnly {
-        match self {
-            FieldName::Name { field, .. } => FieldOnly::Name(field),
-            FieldName::Pos { field, .. } => FieldOnly::Pos(*field),
-        }
-    }
-
-    pub fn field_name(&self) -> Option<&str> {
-        match self {
-            FieldName::Name { field, .. } => Some(field),
-            FieldName::Pos { .. } => None,
-        }
+    pub fn field(&self) -> ColId {
+        self.col
     }
 }
 
-#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
-pub enum FieldExpr {
-    Name(FieldName),
+// TODO(perf): Remove `Clone` derivation.
+#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash, From)]
+pub enum ColExpr {
+    Col(ColId),
     Value(AlgebraicValue),
 }
 
-impl From<AlgebraicValue> for FieldExpr {
-    fn from(x: AlgebraicValue) -> Self {
-        Self::Value(x)
+impl ColExpr {
+    /// Returns a borrowed version of `ColExpr`.
+    pub fn borrowed(&self) -> ColExprRef<'_> {
+        match self {
+            Self::Col(x) => ColExprRef::Col(*x),
+            Self::Value(x) => ColExprRef::Value(x),
+        }
     }
 }
 
-impl From<FieldName> for FieldExpr {
-    fn from(x: FieldName) -> Self {
-        Self::Name(x)
+impl fmt::Debug for FieldName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
     }
 }
 
 impl fmt::Display for FieldName {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            FieldName::Name { table, field } => {
-                write!(f, "{table}.{field}")
-            }
-            FieldName::Pos { table, field } => {
-                write!(f, "{table}.{field}")
-            }
-        }
+        write!(f, "table#{}.col#{}", self.table, self.col)
     }
 }
 
-impl fmt::Display for FieldExpr {
+impl fmt::Display for ColExpr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            FieldExpr::Name(x) => {
-                write!(f, "{x}")
-            }
-            FieldExpr::Value(x) => {
-                let ty = x.type_of();
-                let ts = Typespace::new(vec![]);
-                write!(f, "{}", WithTypespace::new(&ts, &ty).with_value(x).to_satn())
-            }
+            ColExpr::Col(x) => write!(f, "{x}"),
+            ColExpr::Value(x) => write!(f, "{}", x.to_satn()),
         }
     }
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
-pub struct ColumnOnlyField<'a> {
-    pub field: FieldOnly<'a>,
-    pub algebraic_type: &'a AlgebraicType,
+/// A borrowed version of `FieldExpr`.
+#[derive(Clone, Copy)]
+pub enum ColExprRef<'a> {
+    Col(ColId),
+    Value(&'a AlgebraicValue),
 }
 
+// TODO(perf): Remove `Clone` derivation.
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct Column {
     pub field: FieldName,
@@ -169,166 +87,175 @@ impl Column {
     pub fn new(field: FieldName, algebraic_type: AlgebraicType) -> Self {
         Self { field, algebraic_type }
     }
-
-    pub fn as_without_table(&self) -> ColumnOnlyField {
-        ColumnOnlyField {
-            field: self.field.field(),
-            algebraic_type: &self.algebraic_type,
-        }
-    }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct HeaderOnlyField<'a> {
-    pub fields: Vec<ColumnOnlyField<'a>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub struct Header {
-    pub table_name: String,
+    pub table_id: TableId,
+    pub table_name: Box<str>,
     pub fields: Vec<Column>,
-}
-
-impl From<Header> for ProductType {
-    fn from(value: Header) -> Self {
-        ProductType::from_iter(value.fields.iter().map(|x| match &x.field {
-            FieldName::Name { field, .. } => ProductTypeElement::new_named(x.algebraic_type.clone(), field),
-            FieldName::Pos { .. } => ProductTypeElement::new(x.algebraic_type.clone(), None),
-        }))
-    }
+    pub constraints: BTreeMap<ColList, Constraints>,
 }
 
 impl Header {
-    pub fn new(table_name: &str, fields: &[Column]) -> Self {
+    /// Create a new header.
+    ///
+    /// `uncombined_constraints` will be normalized using [`combine_constraints`].
+    pub fn new(
+        table_id: TableId,
+        table_name: Box<str>,
+        fields: Vec<Column>,
+        uncombined_constraints: impl IntoIterator<Item = (ColList, Constraints)>,
+    ) -> Self {
         Self {
-            table_name: table_name.into(),
-            fields: fields.into(),
+            table_id,
+            table_name,
+            fields,
+            constraints: combine_constraints(uncombined_constraints),
         }
     }
 
-    pub fn from_product_type(table_name: &str, fields: ProductType) -> Self {
-        let mut cols = Vec::with_capacity(fields.elements.len());
-
-        for (pos, f) in fields.elements.into_iter().enumerate() {
-            let name = match f.name {
-                None => FieldName::Pos {
-                    table: table_name.into(),
-                    field: pos,
-                },
-                Some(x) => FieldName::Name {
-                    table: table_name.into(),
-                    field: x,
-                },
-            };
-            cols.push(Column::new(name, f.algebraic_type));
-        }
-
-        Self::new(table_name, &cols)
-    }
-
-    pub fn for_mem_table(fields: ProductType) -> Self {
-        let table_name = format!("mem#{:x}", calculate_hash(&fields));
-        Self::from_product_type(&table_name, fields)
-    }
-
-    pub fn as_without_table_name(&self) -> HeaderOnlyField {
-        HeaderOnlyField {
-            fields: self.fields.iter().map(|x| x.as_without_table()).collect(),
-        }
-    }
-
-    pub fn ty(&self) -> ProductType {
-        ProductType::from_iter(
-            self.fields
-                .iter()
-                .map(|x| (x.field.field_name(), x.algebraic_type.clone())),
+    /// Equivalent to what [`Clone::clone`] would do.
+    ///
+    /// `Header` intentionally does not implement `Clone`,
+    /// as we can't afford to clone it in normal execution paths.
+    /// However, we don't care about performance in error paths,
+    /// and we need to embed owned `Header`s in error objects to report useful messages.
+    pub fn clone_for_error(&self) -> Self {
+        Header::new(
+            self.table_id,
+            self.table_name.clone(),
+            self.fields.clone(),
+            self.constraints.clone(),
         )
     }
 
-    pub fn find_by_name(&self, field_name: &str) -> Option<&Column> {
-        self.fields.iter().find(|x| x.field.field_name() == Some(field_name))
+    /// Finds the index of the column wth a matching `FieldName`.
+    pub fn column_pos(&self, col: FieldName) -> Option<ColId> {
+        self.fields.iter().position(|f| f.field == col).map(Into::into)
     }
 
-    pub fn column_pos<'a>(&'a self, col: &'a FieldName) -> Option<usize> {
-        match col {
-            FieldName::Name { .. } => self.fields.iter().position(|f| &f.field == col),
-            FieldName::Pos { field, .. } => self
-                .fields
-                .iter()
-                .enumerate()
-                .position(|(pos, f)| &f.field == col || *field == pos),
-        }
+    pub fn column_pos_or_err(&self, col: FieldName) -> Result<ColId, RelationError> {
+        self.column_pos(col)
+            .ok_or_else(|| RelationError::FieldNotFound(self.clone_for_error(), col))
     }
 
-    /// Finds the position of a field with `name`.
-    pub fn find_pos_by_name(&self, name: &str) -> Option<usize> {
-        let field = FieldName::named(&self.table_name, name);
-        self.column_pos(&field)
+    pub fn field_name(&self, col: FieldName) -> Option<(ColId, FieldName)> {
+        self.column_pos(col).map(|id| (id, self.fields[id.idx()].field))
     }
 
-    pub fn column<'a>(&'a self, col: &'a FieldName) -> Option<&Column> {
-        self.fields.iter().find(|f| &f.field == col)
+    /// Copy the [Constraints] that are referenced in the list of `for_columns`
+    fn retain_constraints(&self, for_columns: &ColList) -> BTreeMap<ColList, Constraints> {
+        // Copy the constraints of the selected columns and retain the multi-column ones...
+        self.constraints
+            .iter()
+            // Keep constraints with a col list where at least one col is in `for_columns`.
+            .filter(|(cols, _)| cols.iter().any(|c| for_columns.contains(c)))
+            .map(|(cols, constraints)| (cols.clone(), *constraints))
+            .collect()
     }
 
-    pub fn project<T>(&self, cols: &[T]) -> Result<Self, RelationError>
-    where
-        T: Into<FieldExpr> + Clone,
-    {
-        let mut p = Vec::with_capacity(cols.len());
+    pub fn has_constraint(&self, field: ColId, constraint: Constraints) -> bool {
+        self.constraints
+            .iter()
+            .any(|(col, ct)| col.contains(field) && ct.contains(&constraint))
+    }
+
+    /// Project the [ColExpr]s & the [Constraints] that referenced them
+    pub fn project(&self, cols: &[ColExpr]) -> Result<Self, RelationError> {
+        let mut fields = Vec::with_capacity(cols.len());
+        let mut to_keep = ColList::with_capacity(cols.len() as _);
 
         for (pos, col) in cols.iter().enumerate() {
-            match col.clone().into() {
-                FieldExpr::Name(col) => {
-                    if let Some(pos) = self.column_pos(&col) {
-                        p.push(self.fields[pos].clone());
-                    } else {
-                        return Err(RelationError::FieldNotFound(self.clone(), col));
-                    }
+            match col {
+                ColExpr::Col(col) => {
+                    to_keep.push(*col);
+                    fields.push(self.fields[col.idx()].clone());
                 }
-                FieldExpr::Value(col) => {
-                    p.push(Column::new(
-                        FieldName::Pos {
-                            table: self.table_name.clone(),
-                            field: pos,
-                        },
-                        col.type_of(),
-                    ));
+                ColExpr::Value(val) => {
+                    // TODO: why should this field name be relevant?
+                    // We should generate immediate names instead.
+                    let field = FieldName::new(self.table_id, pos.into());
+                    let ty = val.type_of().ok_or_else(|| {
+                        RelationError::TypeInference(field, TypeError::CannotInferType { value: val.clone() })
+                    })?;
+                    fields.push(Column::new(field, ty));
                 }
             }
         }
 
-        Ok(Self::new(&self.table_name, &p))
+        let constraints = self.retain_constraints(&to_keep);
+
+        Ok(Self::new(self.table_id, self.table_name.clone(), fields, constraints))
     }
 
-    /// Adds the fields from `right` to this [`Header`],
+    /// Project the ourself onto the `ColList`, keeping constraints that reference the columns in the ColList.
+    /// Does not change `ColIDs`.
+    pub fn project_col_list(&self, cols: &ColList) -> Self {
+        let mut fields = Vec::with_capacity(cols.len() as usize);
+
+        for col in cols.iter() {
+            fields.push(self.fields[col.idx()].clone());
+        }
+
+        let constraints = self.retain_constraints(cols);
+        Self::new(self.table_id, self.table_name.clone(), fields, constraints)
+    }
+
+    /// Adds the fields &  [Constraints] from `right` to this [`Header`],
     /// renaming duplicated fields with a counter like `a, a => a, a0`.
     pub fn extend(&self, right: &Self) -> Self {
-        let count = self.fields.len() + right.fields.len();
+        // Increase the positions of the columns in `right.constraints`, adding the count of fields on `left`
+        let mut constraints = self.constraints.clone();
+        let len_lhs = self.fields.len() as u16;
+        constraints.extend(right.constraints.iter().map(|(cols, c)| {
+            let cols = cols.iter().map(|col| ColId(col.0 + len_lhs)).collect::<ColList>();
+            (cols, *c)
+        }));
+
         let mut fields = self.fields.clone();
-        fields.reserve(count - fields.len());
+        fields.extend(right.fields.iter().cloned());
 
-        let mut cont = 0;
-        //Avoid duplicated field names...
-        for mut f in right.fields.iter().cloned() {
-            if f.field.table() == self.table_name && self.column_pos(&f.field).is_some() {
-                let name = format!("{}_{}", f.field.field(), cont);
-                f.field = FieldName::Name {
-                    table: f.field.table().into(),
-                    field: name,
-                };
-
-                cont += 1;
-            }
-            fields.push(f);
-        }
-
-        Self::new(&self.table_name, &fields)
+        Self::new(self.table_id, self.table_name.clone(), fields, constraints)
     }
+}
+
+/// Combine constraints.
+/// The result is a map from `ColList` to `Constraints`.
+/// In particular, it includes all indexes, and tells you which of them are unique.
+/// The result MAY contain multiple `ColList`s with the same columns in different orders.
+/// This corresponds to differently-ordered indices.
+///
+/// Unique constraints are considered logically unordered. Information from them will
+/// be propagated to all indices that contain the same columns.
+pub fn combine_constraints(
+    uncombined: impl IntoIterator<Item = (ColList, Constraints)>,
+) -> BTreeMap<ColList, Constraints> {
+    let mut constraints = BTreeMap::new();
+    for (col_list, constraint) in uncombined {
+        let slot = constraints.entry(col_list).or_insert(Constraints::unset());
+        *slot = slot.push(constraint);
+    }
+
+    let mut uniques: HashSet<ColSet> = HashSet::default();
+    for (col_list, constraint) in &constraints {
+        if constraint.has_unique() {
+            uniques.insert(col_list.into());
+        }
+    }
+
+    for (cols, constraint) in constraints.iter_mut() {
+        if uniques.contains(&ColSet::from(cols)) {
+            *constraint = constraint.push(Constraints::unique());
+        }
+    }
+
+    constraints
 }
 
 impl fmt::Display for Header {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "[",)?;
+        write!(f, "[")?;
         for (pos, col) in self.fields.iter().enumerate() {
             write!(
                 f,
@@ -341,250 +268,23 @@ impl fmt::Display for Header {
                 write!(f, ", ")?;
             }
         }
-        write!(f, "]",)
-    }
-}
-
-impl From<ProductType> for Header {
-    fn from(value: ProductType) -> Self {
-        Header::for_mem_table(value)
-    }
-}
-
-impl From<AlgebraicType> for Header {
-    fn from(value: AlgebraicType) -> Self {
-        Header::for_mem_table(value.into())
-    }
-}
-
-/// An estimate for the range of rows in the [Relation]
-#[derive(Debug, Copy, Clone, PartialOrd, Ord, PartialEq, Eq)]
-pub struct RowCount {
-    pub min: usize,
-    pub max: Option<usize>,
-}
-
-impl RowCount {
-    pub fn exact(rows: usize) -> Self {
-        Self {
-            min: rows,
-            max: Some(rows),
-        }
-    }
-
-    pub fn unknown() -> Self {
-        Self { min: 0, max: None }
-    }
-
-    pub fn add_exact(&mut self, count: usize) {
-        self.min += count;
-        self.max = Some(self.min);
-    }
-}
-
-/// A [Relation] is anything that could be represented as a [Header] of `[ColumnName:ColumnType]` that
-/// generates rows/tuples of [AlgebraicValue] that exactly match that [Header].
-pub trait Relation {
-    fn head(&self) -> Header;
-    /// Specify the size in rows of the [Relation].
-    ///
-    /// Warning: It should at least be precise in the lower-bound estimate.
-    fn row_count(&self) -> RowCount;
-}
-
-/// Common wrapper for relational iterators that work like cursors.
-#[derive(Debug)]
-pub struct RelIter<T> {
-    pub head: Header,
-    pub row_count: RowCount,
-    pub pos: usize,
-    pub of: T,
-}
-
-impl<T> RelIter<T> {
-    pub fn new(head: Header, row_count: RowCount, of: T) -> Self {
-        Self {
-            head,
-            row_count,
-            pos: 0,
-            of,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct RelValueRef<'a> {
-    pub head: &'a Header,
-    pub data: &'a ProductValue,
-}
-
-impl<'a> RelValueRef<'a> {
-    pub fn new(head: &'a Header, data: &'a ProductValue) -> Self {
-        Self { head, data }
-    }
-
-    pub fn get(&self, col: &'a FieldExpr) -> &'a AlgebraicValue {
-        match col {
-            FieldExpr::Name(col) => {
-                if let Some(pos) = self.head.column_pos(col) {
-                    if let Some(v) = self.data.elements.get(pos) {
-                        v
-                    } else {
-                        unreachable!("Field `{col}` at pos {pos} not found on row: {:?}", self.data.elements)
-                    }
-                } else {
-                    unreachable!(
-                        "Field `{col}` not found on `{}`. Fields:{}",
-                        self.head.table_name, self.head
-                    )
-                }
-            }
-            FieldExpr::Value(x) => x,
-        }
-    }
-
-    pub fn project(&self, cols: &[FieldExpr]) -> Result<ProductValue, RelationError> {
-        let mut elements = Vec::with_capacity(cols.len());
-
-        for col in cols {
-            match col {
-                FieldExpr::Name(col) => {
-                    if let Some(pos) = self.head.column_pos(col) {
-                        elements.push(self.data.elements[pos].clone());
-                    } else {
-                        return Err(RelationError::FieldNotFound(self.head.clone(), col.clone()));
-                    }
-                }
-                FieldExpr::Value(col) => {
-                    elements.push(col.clone());
-                }
-            }
-        }
-
-        Ok(ProductValue::new(&elements))
-    }
-}
-
-impl Relation for RelValueRef<'_> {
-    fn head(&self) -> Header {
-        self.head.clone()
-    }
-
-    fn row_count(&self) -> RowCount {
-        RowCount::exact(1)
-    }
-}
-
-/// The row/tuple generated by a [Relation] operator
-#[derive(Debug, Clone)]
-pub struct RelValue {
-    pub head: Header,
-    pub data: ProductValue,
-}
-
-impl RelValue {
-    pub fn new(head: &Header, data: &ProductValue) -> Self {
-        Self {
-            head: head.clone(),
-            data: data.clone(),
-        }
-    }
-
-    pub fn as_val_ref(&self) -> RelValueRef {
-        RelValueRef::new(&self.head, &self.data)
-    }
-
-    pub fn extend(self, head: &Header, with: RelValue) -> RelValue {
-        let mut x = self;
-        x.head = head.clone();
-        x.data.elements.extend(with.data.elements.into_iter());
-        x
-    }
-}
-
-/// An in-memory table
-#[derive(Debug, Clone, Eq, PartialEq, PartialOrd, Ord)]
-pub struct MemTableWithoutTableName<'a> {
-    pub head: HeaderOnlyField<'a>,
-    pub data: &'a [ProductValue],
-}
-
-/// An in-memory table
-#[derive(Debug, Clone, Eq, PartialEq, PartialOrd, Ord)]
-pub struct MemTable {
-    pub head: Header,
-    pub data: Vec<ProductValue>,
-    pub table_access: StAccess,
-}
-
-impl MemTable {
-    pub fn new(head: &Header, table_access: StAccess, data: &[ProductValue]) -> Self {
-        assert_eq!(
-            head.fields.len(),
-            data.first()
-                .map(|x| x.elements.len())
-                .unwrap_or_else(|| head.fields.len()),
-            "Not match the number of columns between the header.len() <> data.len()"
-        );
-        Self {
-            head: head.clone(),
-            data: data.into(),
-            table_access,
-        }
-    }
-
-    pub fn from_value(of: AlgebraicValue) -> Self {
-        let head = Header::for_mem_table(of.type_of().into());
-        Self::new(&head, StAccess::Public, &[of.into()])
-    }
-
-    pub fn from_iter(head: &Header, data: impl Iterator<Item = ProductValue>) -> Self {
-        Self {
-            head: head.clone(),
-            data: data.collect(),
-            table_access: StAccess::Public,
-        }
-    }
-
-    pub fn as_without_table_name(&self) -> MemTableWithoutTableName {
-        MemTableWithoutTableName {
-            head: self.head.as_without_table_name(),
-            data: &self.data,
-        }
-    }
-
-    pub fn get_field(&self, pos: usize) -> Option<&FieldName> {
-        self.head.fields.get(pos).map(|x| &x.field)
-    }
-
-    pub fn get_field_named(&self, name: &str) -> Option<&FieldName> {
-        self.head.find_by_name(name).map(|x| &x.field)
-    }
-}
-
-impl Relation for MemTable {
-    fn head(&self) -> Header {
-        self.head.clone()
-    }
-
-    fn row_count(&self) -> RowCount {
-        RowCount::exact(self.data.len())
+        write!(f, "]")
     }
 }
 
 /// A stored table from [RelationalDB]
-#[derive(Debug, Clone, Eq, PartialEq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub struct DbTable {
-    pub head: Header,
-    pub table_id: u32,
+    pub head: Arc<Header>,
+    pub table_id: TableId,
     pub table_type: StTableType,
     pub table_access: StAccess,
 }
 
 impl DbTable {
-    pub fn new(head: &Header, table_id: u32, table_type: StTableType, table_access: StAccess) -> Self {
+    pub fn new(head: Arc<Header>, table_id: TableId, table_type: StTableType, table_access: StAccess) -> Self {
         Self {
-            head: head.clone(),
+            head,
             table_id,
             table_type,
             table_access,
@@ -592,57 +292,103 @@ impl DbTable {
     }
 }
 
-impl Relation for DbTable {
-    fn head(&self) -> Header {
-        self.head.clone()
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use spacetimedb_primitives::col_list;
+
+    /// Build a [Header] using the initial `start_pos` as the column position for the [Constraints]
+    fn head(id: impl Into<TableId>, name: &str, fields: (ColId, ColId), start_pos: u16) -> Header {
+        let pos_lhs = start_pos;
+        let pos_rhs = start_pos + 1;
+
+        let ct = vec![
+            (ColId(pos_lhs).into(), Constraints::indexed()),
+            (ColId(pos_rhs).into(), Constraints::identity()),
+            (col_list![pos_lhs, pos_rhs], Constraints::primary_key()),
+            (col_list![pos_rhs, pos_lhs], Constraints::unique()),
+        ];
+
+        let id = id.into();
+        let fields = [fields.0, fields.1].map(|col| Column::new(FieldName::new(id, col), AlgebraicType::I8));
+        Header::new(id, name.into(), fields.into(), ct)
     }
 
-    fn row_count(&self) -> RowCount {
-        RowCount::unknown()
-    }
-}
+    #[test]
+    fn test_project() {
+        let a = 0.into();
+        let b = 1.into();
 
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub enum Table {
-    MemTable(MemTable),
-    DbTable(DbTable),
-}
+        let head = head(0, "t1", (a, b), 0);
+        let new = head.project(&[] as &[ColExpr]).unwrap();
 
-impl Table {
-    pub fn table_name(&self) -> &str {
-        match self {
-            Self::MemTable(x) => &x.head.table_name,
-            Self::DbTable(x) => &x.head.table_name,
-        }
-    }
+        let mut empty = head.clone_for_error();
+        empty.fields.clear();
+        empty.constraints.clear();
+        assert_eq!(empty, new);
 
-    pub fn table_type(&self) -> StTableType {
-        match self {
-            Self::MemTable(_) => StTableType::User,
-            Self::DbTable(x) => x.table_type,
-        }
-    }
+        let all = head.clone_for_error();
+        let new = head.project(&[a, b].map(ColExpr::Col)).unwrap();
+        assert_eq!(all, new);
 
-    pub fn table_access(&self) -> StAccess {
-        match self {
-            Self::MemTable(x) => x.table_access,
-            Self::DbTable(x) => x.table_access,
-        }
-    }
-}
+        let mut first = head.clone_for_error();
+        first.fields.pop();
+        first.constraints = first.retain_constraints(&a.into());
+        let new = head.project(&[a].map(ColExpr::Col)).unwrap();
+        assert_eq!(first, new);
 
-impl Relation for Table {
-    fn head(&self) -> Header {
-        match self {
-            Table::MemTable(x) => x.head(),
-            Table::DbTable(x) => x.head(),
-        }
+        let mut second = head.clone_for_error();
+        second.fields.remove(0);
+        second.constraints = second.retain_constraints(&b.into());
+        let new = head.project(&[b].map(ColExpr::Col)).unwrap();
+        assert_eq!(second, new);
     }
 
-    fn row_count(&self) -> RowCount {
-        match self {
-            Table::MemTable(x) => x.row_count(),
-            Table::DbTable(x) => x.row_count(),
-        }
+    #[test]
+    fn test_extend() {
+        let t1 = 0.into();
+        let t2: TableId = 1.into();
+        let a = 0.into();
+        let b = 1.into();
+        let c = 0.into();
+        let d = 1.into();
+
+        let head_lhs = head(t1, "t1", (a, b), 0);
+        let head_rhs = head(t2, "t2", (c, d), 0);
+
+        let new = head_lhs.extend(&head_rhs);
+
+        let lhs = new.project(&[a, b].map(ColExpr::Col)).unwrap();
+        assert_eq!(head_lhs, lhs);
+
+        let mut head_rhs = head(t2, "t2", (c, d), 2);
+        head_rhs.table_id = t1;
+        head_rhs.table_name = head_lhs.table_name.clone();
+        let rhs = new.project(&[2, 3].map(ColId).map(ColExpr::Col)).unwrap();
+        assert_eq!(head_rhs, rhs);
+    }
+
+    #[test]
+    fn test_combine_constraints() {
+        let raw = vec![
+            (col_list![0], Constraints::indexed()),
+            (col_list![0], Constraints::unique()),
+            (col_list![1], Constraints::identity()),
+            (col_list![1, 0], Constraints::primary_key()),
+            (col_list![0, 1], Constraints::unique()),
+            (col_list![2], Constraints::indexed()),
+            (col_list![3], Constraints::unique()),
+        ];
+        let expected = vec![
+            (col_list![0], Constraints::indexed().push(Constraints::unique())),
+            (col_list![1], Constraints::identity()),
+            (col_list![1, 0], Constraints::primary_key().push(Constraints::unique())),
+            (col_list![0, 1], Constraints::unique()),
+            (col_list![2], Constraints::indexed()),
+            (col_list![3], Constraints::unique()),
+        ]
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+        assert_eq!(combine_constraints(raw), expected);
     }
 }

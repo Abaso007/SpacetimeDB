@@ -1,28 +1,42 @@
-use base64::{engine::general_purpose::STANDARD as BASE_64_STD, Engine as _};
+use anyhow::Context;
+use base64::{
+    engine::general_purpose::STANDARD as BASE_64_STD, engine::general_purpose::STANDARD_NO_PAD as BASE_64_STD_NO_PAD,
+    Engine as _,
+};
 use reqwest::RequestBuilder;
 use serde::Deserialize;
-use spacetimedb_lib::name::{is_address, DnsLookupResponse, RegisterTldResult, ReverseDNSResponse};
-use spacetimedb_lib::Identity;
+use spacetimedb::auth::identity::{IncomingClaims, SpacetimeIdentityClaims};
+use spacetimedb_client_api_messages::name::{DnsLookupResponse, RegisterTldResult, ReverseDNSResponse};
+use spacetimedb_data_structures::map::HashMap;
+use spacetimedb_lib::{AlgebraicType, Identity};
+use std::io::Write;
 use std::path::Path;
-use std::process::exit;
 
-use crate::config::{Config, IdentityConfig};
+use crate::config::Config;
 
-/// Determine the address of the `database`.
-pub async fn database_address(config: &Config, database: &str) -> Result<String, anyhow::Error> {
-    if is_address(database) {
-        return Ok(database.to_string());
+/// Determine the identity of the `database`.
+pub async fn database_identity(
+    config: &Config,
+    name_or_identity: &str,
+    server: Option<&str>,
+) -> Result<Identity, anyhow::Error> {
+    if let Ok(identity) = Identity::from_hex(name_or_identity) {
+        return Ok(identity);
     }
-    match spacetime_dns(config, database).await? {
-        DnsLookupResponse::Success { domain: _, address } => Ok(address),
+    match spacetime_dns(config, name_or_identity, server).await? {
+        DnsLookupResponse::Success { domain: _, identity } => Ok(identity),
         DnsLookupResponse::Failure { domain } => Err(anyhow::anyhow!("The dns resolution of `{}` failed.", domain)),
     }
 }
 
-/// Converts a name to a database address.
-pub async fn spacetime_dns(config: &Config, domain: &str) -> Result<DnsLookupResponse, anyhow::Error> {
+/// Converts a name to a database identity.
+pub async fn spacetime_dns(
+    config: &Config,
+    domain: &str,
+    server: Option<&str>,
+) -> Result<DnsLookupResponse, anyhow::Error> {
     let client = reqwest::Client::new();
-    let url = format!("{}/database/dns/{}", config.get_host_url(), domain);
+    let url = format!("{}/database/dns/{}", config.get_host_url(server)?, domain);
     let res = client.get(url).send().await?.error_for_status()?;
     let bytes = res.bytes().await.unwrap();
     Ok(serde_json::from_slice(&bytes[..]).unwrap())
@@ -32,26 +46,37 @@ pub async fn spacetime_dns(config: &Config, domain: &str) -> Result<DnsLookupRes
 /// identity will be looked up in the config and it will be used instead. Returns Ok() if the
 /// domain is successfully registered, returns Err otherwise.
 pub async fn spacetime_register_tld(
-    config: &mut Config,
+    config: &Config,
     tld: &str,
-    identity: Option<&String>,
+    server: Option<&str>,
 ) -> Result<RegisterTldResult, anyhow::Error> {
-    let auth_header = get_auth_header_only(config, false, identity).await.unwrap();
+    let auth_header = get_auth_header(config, false)?;
 
     // TODO(jdetter): Fix URL encoding on specifying this domain
-    let builder =
-        reqwest::Client::new().get(format!("{}/database/register_tld?tld={}", config.get_host_url(), tld).as_str());
-    let builder = add_auth_header_opt(builder, &Some(auth_header));
+    let builder = reqwest::Client::new()
+        .get(format!("{}/database/register_tld?tld={}", config.get_host_url(server)?, tld).as_str());
+    let builder = add_auth_header_opt(builder, &auth_header);
 
     let res = builder.send().await?.error_for_status()?;
     let bytes = res.bytes().await.unwrap();
     Ok(serde_json::from_slice(&bytes[..]).unwrap())
 }
 
-/// Returns all known names for the given address.
-pub async fn spacetime_reverse_dns(config: &Config, address: &str) -> Result<ReverseDNSResponse, anyhow::Error> {
+pub async fn spacetime_server_fingerprint(url: &str) -> anyhow::Result<String> {
+    let builder = reqwest::Client::new().get(format!("{}/identity/public-key", url).as_str());
+    let res = builder.send().await?.error_for_status()?;
+    let fingerprint = res.text().await?;
+    Ok(fingerprint)
+}
+
+/// Returns all known names for the given identity.
+pub async fn spacetime_reverse_dns(
+    config: &Config,
+    identity: &str,
+    server: Option<&str>,
+) -> Result<ReverseDNSResponse, anyhow::Error> {
     let client = reqwest::Client::new();
-    let url = format!("{}/database/reverse_dns/{}", config.get_host_url(), address);
+    let url = format!("{}/database/reverse_dns/{}", config.get_host_url(server)?, identity);
     let res = client.get(url).send().await?.error_for_status()?;
     let bytes = res.bytes().await.unwrap();
     Ok(serde_json::from_slice(&bytes[..]).unwrap())
@@ -59,7 +84,7 @@ pub async fn spacetime_reverse_dns(config: &Config, address: &str) -> Result<Rev
 
 #[derive(Deserialize)]
 pub struct IdentityTokenJson {
-    pub identity: String,
+    pub identity: Identity,
     pub token: String,
 }
 
@@ -69,80 +94,60 @@ pub enum InitDefaultResultType {
 }
 
 pub struct InitDefaultResult {
-    pub identity_config: IdentityConfig,
     pub result_type: InitDefaultResultType,
 }
 
-pub async fn init_default(config: &mut Config, nickname: Option<String>) -> Result<InitDefaultResult, anyhow::Error> {
-    if config.name_exists(nickname.as_ref().unwrap_or(&"".to_string())) {
-        return Err(anyhow::anyhow!("A default identity already exists."));
-    }
-
-    let client = reqwest::Client::new();
-    let builder = client.post(format!("{}/identity", config.get_host_url()));
-
-    if let Some(identity_config) = config.get_default_identity_config() {
-        return Ok(InitDefaultResult {
-            identity_config: identity_config.clone(),
-            result_type: InitDefaultResultType::Existing,
-        });
-    }
-
-    let res = builder.send().await?;
-    let res = res.error_for_status()?;
-
-    let body = res.bytes().await?;
-    let body = String::from_utf8(body.to_vec())?;
-
-    let identity_token: IdentityTokenJson = serde_json::from_str(&body)?;
-
-    let identity = identity_token.identity.clone();
-
-    let identity_config = IdentityConfig {
-        identity: identity_token.identity,
-        token: identity_token.token,
-        nickname: nickname.clone(),
-    };
-    config.identity_configs_mut().push(identity_config.clone());
-    if config.default_identity().is_none() {
-        config.set_default_identity(identity);
-    }
-    config.save();
-    Ok(InitDefaultResult {
-        identity_config,
-        result_type: InitDefaultResultType::SavedNew,
-    })
+#[derive(Debug, Deserialize, Clone)]
+pub struct DescribeReducer {
+    #[serde(rename = "type")]
+    pub type_field: String,
+    pub arity: i32,
+    pub schema: DescribeSchema,
 }
 
-/// Selects an `identity_config` from the config file. If you specify the
-/// identity it will either return the `identity_config` for the specified
-/// identity, or return an error if it cannot be found.  If you do not specify
-/// an identity this function will either get the default identity if one exists
-/// or create and save a new default identity.
-pub async fn select_identity_config(
-    config: &mut Config,
-    identity_or_name: Option<&str>,
-) -> Result<IdentityConfig, anyhow::Error> {
-    let resolve_identity_to_identity_config = |ident: &str| -> Result<IdentityConfig, anyhow::Error> {
-        config
-            .get_identity_config_by_identity(ident)
-            .map(Clone::clone)
-            .ok_or_else(|| anyhow::anyhow!("Missing identity credentials for identity: {}", ident))
-    };
+#[derive(Debug, Deserialize, Clone)]
+pub struct DescribeSchema {
+    pub name: String,
+    pub elements: Vec<DescribeElement>,
+}
 
-    if let Some(identity_or_name) = identity_or_name {
-        if is_hex_identity(identity_or_name) {
-            resolve_identity_to_identity_config(identity_or_name)
-        } else {
-            // First check to see if we can convert the name to an identity, then return the config for that identity
-            match config.resolve_name_to_identity(Some(identity_or_name))? {
-                None => Err(anyhow::anyhow!("No such identity for name: {}", identity_or_name,)),
-                Some(identity) => resolve_identity_to_identity_config(&identity),
-            }
-        }
-    } else {
-        Ok(init_default(config, None).await?.identity_config)
-    }
+#[derive(Debug, Deserialize, Clone)]
+pub struct DescribeElement {
+    pub name: Option<DescribeElementName>,
+    pub algebraic_type: AlgebraicType,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct DescribeElementName {
+    pub some: String,
+}
+
+pub async fn describe_reducer(
+    config: &mut Config,
+    database: Identity,
+    server: Option<String>,
+    reducer_name: String,
+    anon_identity: bool,
+) -> anyhow::Result<DescribeReducer> {
+    let builder = reqwest::Client::new().get(format!(
+        "{}/database/schema/{}/{}/{}",
+        config.get_host_url(server.as_deref())?,
+        database,
+        "reducer",
+        reducer_name
+    ));
+    let auth_header = get_auth_header(config, anon_identity)?;
+    let builder = add_auth_header_opt(builder, &auth_header);
+
+    let descr = builder
+        .query(&[("expand", true)])
+        .send()
+        .await?
+        .error_for_status()?
+        .text()
+        .await?;
+    let result: HashMap<String, DescribeReducer> = serde_json::from_str(descr.as_str()).unwrap();
+    Ok(result[&reducer_name].clone())
 }
 
 /// Add an authorization header, if provided, to the request `builder`.
@@ -151,17 +156,6 @@ pub fn add_auth_header_opt(mut builder: RequestBuilder, auth_header: &Option<Str
         builder = builder.header("Authorization", auth_header);
     }
     builder
-}
-
-/// See [`get_auth_header`].
-pub async fn get_auth_header_only(
-    config: &mut Config,
-    anon_identity: bool,
-    identity_or_name: Option<&String>,
-) -> Option<String> {
-    get_auth_header(config, anon_identity, identity_or_name.map(|x| x.as_str()))
-        .await
-        .map(|(ah, _)| ah)
 }
 
 /// Gets the `auth_header` for a request to the server depending on how you want
@@ -176,57 +170,16 @@ pub async fn get_auth_header_only(
 ///  * `config` - The config file reference
 ///  * `anon_identity` - Whether or not to just use an anonymous identity (no identity)
 ///  * `identity_or_name` - The identity to try to lookup, which is typically provided from the command line
-pub async fn get_auth_header(
-    config: &mut Config,
-    anon_identity: bool,
-    identity_or_name: Option<&str>,
-) -> Option<(String, Identity)> {
-    if !anon_identity {
-        let identity_config = match select_identity_config(config, identity_or_name).await {
-            Ok(ic) => ic,
-            Err(err) => {
-                println!("{}", err);
-                exit(1);
-            }
-        };
+pub fn get_auth_header(config: &Config, anon_identity: bool) -> anyhow::Result<Option<String>> {
+    if anon_identity {
+        Ok(None)
+    } else {
+        let token = config.spacetimedb_token_or_error()?;
         // The current form is: Authorization: Basic base64("token:<token>")
         let mut auth_header = String::new();
-        auth_header.push_str(
-            format!(
-                "Basic {}",
-                BASE_64_STD.encode(format!("token:{}", identity_config.token))
-            )
-            .as_str(),
-        );
-        match Identity::from_hex(identity_config.identity.clone()) {
-            Ok(identity) => Some((auth_header, identity)),
-            Err(_) => {
-                println!(
-                    "Local config contains invalid malformed identity: {}",
-                    identity_config.identity
-                );
-                exit(1)
-            }
-        }
-    } else {
-        None
+        auth_header.push_str(format!("Basic {}", BASE_64_STD.encode(format!("token:{}", token))).as_str());
+        Ok(Some(auth_header))
     }
-}
-
-pub fn is_hex_identity(ident: &str) -> bool {
-    ident.len() == 64 && ident.chars().all(|c| c.is_ascii_hexdigit())
-}
-
-pub fn print_identity_config(ident: &IdentityConfig) {
-    println!(" IDENTITY  {}", ident.identity);
-    println!(
-        " NAME      {}",
-        match &ident.nickname {
-            None => "",
-            Some(name) => name.as_str(),
-        }
-    );
-    // TODO: lookup email here when we have an API endpoint for it
 }
 
 pub const VALID_PROTOCOLS: [&str; 2] = ["http", "https"];
@@ -249,11 +202,82 @@ impl clap::ValueEnum for ModuleLanguage {
 }
 
 pub fn detect_module_language(path_to_project: &Path) -> ModuleLanguage {
-    // TODO: Possible add a config file during spacetime init with the language
+    // TODO: Possible add a config file durlng spacetime init with the language
     // check for Cargo.toml
     if path_to_project.join("Cargo.toml").exists() {
         ModuleLanguage::Rust
     } else {
         ModuleLanguage::Csharp
     }
+}
+
+pub fn url_to_host_and_protocol(url: &str) -> anyhow::Result<(&str, &str)> {
+    if contains_protocol(url) {
+        let protocol = url.split("://").next().unwrap();
+        let host = url.split("://").last().unwrap();
+
+        if !VALID_PROTOCOLS.contains(&protocol) {
+            Err(anyhow::anyhow!("Invalid protocol: {}", protocol))
+        } else {
+            Ok((host, protocol))
+        }
+    } else {
+        Err(anyhow::anyhow!("Invalid url: {}", url))
+    }
+}
+
+pub fn contains_protocol(name_or_url: &str) -> bool {
+    name_or_url.contains("://")
+}
+
+pub fn host_or_url_to_host_and_protocol(host_or_url: &str) -> (&str, Option<&str>) {
+    if contains_protocol(host_or_url) {
+        let (host, protocol) = url_to_host_and_protocol(host_or_url).unwrap();
+        (host, Some(protocol))
+    } else {
+        (host_or_url, None)
+    }
+}
+
+/// Prompt the user for `y` or `n` from stdin.
+///
+/// Return `false` unless the input is `y`.
+pub fn y_or_n(force: bool, prompt: &str) -> anyhow::Result<bool> {
+    if force {
+        println!("Skipping confirmation due to --yes");
+        return Ok(true);
+    }
+    let mut input = String::new();
+    print!("{} [y/N]", prompt);
+    std::io::stdout().flush()?;
+    std::io::stdin().read_line(&mut input)?;
+    let input = input.trim().to_lowercase();
+    Ok(input == "y" || input == "yes")
+}
+
+pub fn unauth_error_context<T>(res: anyhow::Result<T>, identity: &str, server: &str) -> anyhow::Result<T> {
+    res.with_context(|| {
+        format!(
+            "Identity {identity} is not valid for server {server}.
+Please log back in with `spacetime logout` and then `spacetime login`."
+        )
+    })
+}
+
+pub fn decode_identity(config: &Config) -> anyhow::Result<String> {
+    let token = config.spacetimedb_token_or_error()?;
+    // Here, we manually extract and decode the claims from the json web token.
+    // We do this without using the `jsonwebtoken` crate because it doesn't seem to have a way to skip signature verification.
+    // But signature verification would require getting the public key from a server, and we don't necessarily want to do that.
+    let token_parts: Vec<_> = token.split('.').collect();
+    if token_parts.len() != 3 {
+        return Err(anyhow::anyhow!("Token does not look like a JSON web token: {}", token));
+    }
+    let decoded_bytes = BASE_64_STD_NO_PAD.decode(token_parts[1])?;
+    let decoded_string = String::from_utf8(decoded_bytes)?;
+
+    let claims_data: IncomingClaims = serde_json::from_str(decoded_string.as_str())?;
+    let claims_data: SpacetimeIdentityClaims = claims_data.try_into()?;
+
+    Ok(claims_data.identity.to_string())
 }

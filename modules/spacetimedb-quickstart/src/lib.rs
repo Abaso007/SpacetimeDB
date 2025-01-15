@@ -1,19 +1,35 @@
-use spacetimedb::{println, spacetimedb};
+use spacetimedb::{log, ReducerContext, Table};
 
-#[spacetimedb(table)]
+#[spacetimedb::table(name = person, public, index(name = age, btree(columns = [age])))]
 pub struct Person {
+    #[primary_key]
+    #[auto_inc]
+    id: u32,
     name: String,
+    age: u8,
 }
 
-#[spacetimedb(reducer)]
-pub fn add(name: String) {
-    Person::insert(Person { name });
+#[spacetimedb::reducer]
+pub fn add(ctx: &ReducerContext, name: String, age: u8) {
+    ctx.db.person().insert(Person { id: 0, name, age });
 }
 
-#[spacetimedb(reducer)]
-pub fn say_hello() {
-    for person in Person::iter() {
-        println!("Hello, {}!", person.name);
+#[spacetimedb::reducer]
+pub fn say_hello(ctx: &ReducerContext) {
+    for person in ctx.db.person().iter() {
+        log::info!("Hello, {}!", person.name);
     }
-    println!("Hello, World!");
+    log::info!("Hello, World!");
+}
+
+#[spacetimedb::reducer]
+pub fn list_over_age(ctx: &ReducerContext, age: u8) {
+    for person in ctx.db.person().age().filter(age..) {
+        log::info!("{} has age {} >= {}", person.name, person.age, age);
+    }
+}
+
+#[spacetimedb::reducer]
+fn log_module_identity(ctx: &ReducerContext) {
+    log::info!("Module identity: {}", ctx.identity());
 }

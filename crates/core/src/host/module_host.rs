@@ -1,27 +1,59 @@
-use super::{ArgsTuple, EnergyDiff, InvalidReducerArguments, ReducerArgs, ReducerCallResult, Timestamp};
-use crate::client::ClientConnectionSender;
-use crate::database_logger::LogLevel;
-use crate::db::datastore::traits::{TableId, TxData, TxOp};
-use crate::db::relational_db::RelationalDB;
+use super::wasm_common::{CLIENT_CONNECTED_DUNDER, CLIENT_DISCONNECTED_DUNDER};
+use super::{ArgsTuple, InvalidReducerArguments, ReducerArgs, ReducerCallResult, ReducerId};
+use crate::client::{ClientActorId, ClientConnectionSender};
+use crate::database_logger::{LogLevel, Record};
+use crate::db::datastore::locking_tx_datastore::MutTxId;
+use crate::db::datastore::system_tables::{StClientFields, StClientRow, ST_CLIENT_ID};
+use crate::db::datastore::traits::{IsolationLevel, Program, TxData};
+use crate::energy::EnergyQuanta;
 use crate::error::DBError;
+use crate::estimation::estimate_rows_scanned;
+use crate::execution_context::{ExecutionContext, ReducerContext, Workload};
 use crate::hash::Hash;
 use crate::identity::Identity;
-use crate::json::client_api::{SubscriptionUpdateJson, TableRowOperationJson, TableUpdateJson};
-use crate::protobuf::client_api::{table_row_operation, SubscriptionUpdate, TableRowOperation, TableUpdate};
-use crate::subscription::module_subscription_actor::ModuleSubscriptionManager;
-use base64::{engine::general_purpose::STANDARD as BASE_64_STD, Engine as _};
-use indexmap::IndexMap;
-use spacetimedb_lib::{ReducerDef, TableDef};
-use spacetimedb_sats::{ProductValue, Typespace, WithTypespace};
-use std::collections::HashMap;
-use std::convert::Infallible;
-use std::sync::Arc;
-use std::time::Duration;
-use tokio::sync::{mpsc, oneshot};
+use crate::messages::control_db::Database;
+use crate::replica_context::ReplicaContext;
+use crate::sql::ast::SchemaViewer;
+use crate::subscription::module_subscription_actor::ModuleSubscriptions;
+use crate::subscription::tx::DeltaTx;
+use crate::util::lending_pool::{Closed, LendingPool, LentResource, PoolClosed};
+use crate::vm::check_row_limit;
+use crate::worker_metrics::WORKER_METRICS;
+use anyhow::Context;
+use bytes::Bytes;
+use derive_more::From;
+use futures::{Future, FutureExt};
+use indexmap::IndexSet;
+use itertools::Itertools;
+use smallvec::SmallVec;
+use spacetimedb_client_api_messages::timestamp::Timestamp;
+use spacetimedb_client_api_messages::websocket::{Compression, OneOffTable, QueryUpdate, WebsocketFormat};
+use spacetimedb_data_structures::error_stream::ErrorStream;
+use spacetimedb_data_structures::map::{HashCollectionExt as _, IntMap};
+use spacetimedb_lib::identity::{AuthCtx, RequestId};
+use spacetimedb_lib::Address;
+use spacetimedb_primitives::{col_list, TableId};
+use spacetimedb_query::SubscribePlan;
+use spacetimedb_sats::{algebraic_value, ProductValue};
+use spacetimedb_schema::auto_migrate::AutoMigrateError;
+use spacetimedb_schema::def::deserialize::ReducerArgsDeserializeSeed;
+use spacetimedb_schema::def::{ModuleDef, ReducerDef};
+use spacetimedb_vm::relation::RelValue;
+use std::fmt;
+use std::sync::{Arc, Weak};
+use std::time::{Duration, Instant};
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, From)]
 pub struct DatabaseUpdate {
     pub tables: Vec<DatabaseTableUpdate>,
+}
+
+impl FromIterator<DatabaseTableUpdate> for DatabaseUpdate {
+    fn from_iter<T: IntoIterator<Item = DatabaseTableUpdate>>(iter: T) -> Self {
+        DatabaseUpdate {
+            tables: iter.into_iter().collect(),
+        }
+    }
 }
 
 impl DatabaseUpdate {
@@ -32,127 +64,78 @@ impl DatabaseUpdate {
         false
     }
 
-    pub fn from_writes(stdb: &RelationalDB, tx_data: &TxData) -> Self {
-        let mut map: HashMap<TableId, Vec<TableOp>> = HashMap::new();
-        //TODO: This should be wrapped with .auto_commit
-        let tx = stdb.begin_tx();
-        for record in tx_data.records.iter() {
-            let op = match record.op {
-                TxOp::Delete => 0,
-                TxOp::Insert(_) => 1,
-            };
-
-            let vec = if let Some(vec) = map.get_mut(&record.table_id) {
-                vec
-            } else {
-                map.insert(record.table_id, Vec::new());
-                map.get_mut(&record.table_id).unwrap()
-            };
-
-            let (row, row_pk) = (record.product_value.clone(), record.key.to_bytes());
-
-            vec.push(TableOp {
-                op_type: op,
-                row_pk,
-                row,
-            });
+    pub fn from_writes(tx_data: &TxData) -> Self {
+        let mut map: IntMap<TableId, DatabaseTableUpdate> = IntMap::new();
+        let new_update = |table_id, table_name: &str| DatabaseTableUpdate {
+            table_id,
+            table_name: table_name.into(),
+            inserts: [].into(),
+            deletes: [].into(),
+        };
+        for (table_id, table_name, rows) in tx_data.inserts_with_table_name() {
+            map.entry(*table_id)
+                .or_insert_with(|| new_update(*table_id, table_name))
+                .inserts = rows.clone();
         }
-
-        let mut table_name_map: HashMap<TableId, String> = HashMap::new();
-        let mut table_updates = Vec::new();
-        for (table_id, table_row_operations) in map.drain() {
-            let table_name = if let Some(name) = table_name_map.get(&table_id) {
-                name.clone()
-            } else {
-                let table_name = stdb.table_name_from_id(&tx, table_id.0).unwrap().unwrap();
-                table_name_map.insert(table_id, table_name.clone());
-                table_name
-            };
-            table_updates.push(DatabaseTableUpdate {
-                table_id: table_id.0,
-                table_name,
-                ops: table_row_operations,
-            });
+        for (table_id, table_name, rows) in tx_data.deletes_with_table_name() {
+            map.entry(*table_id)
+                .or_insert_with(|| new_update(*table_id, table_name))
+                .deletes = rows.clone();
         }
-        stdb.rollback_tx(tx);
-
-        DatabaseUpdate { tables: table_updates }
-    }
-
-    pub fn into_protobuf(self) -> SubscriptionUpdate {
-        SubscriptionUpdate {
-            table_updates: self
-                .tables
-                .into_iter()
-                .map(|table| TableUpdate {
-                    table_id: table.table_id,
-                    table_name: table.table_name,
-                    table_row_operations: table
-                        .ops
-                        .into_iter()
-                        .map(|op| {
-                            let mut row_bytes = Vec::new();
-                            op.row.encode(&mut row_bytes);
-                            TableRowOperation {
-                                op: if op.op_type == 1 {
-                                    table_row_operation::OperationType::Insert.into()
-                                } else {
-                                    table_row_operation::OperationType::Delete.into()
-                                },
-                                row_pk: op.row_pk,
-                                row: row_bytes,
-                            }
-                        })
-                        .collect(),
-                })
-                .collect(),
+        DatabaseUpdate {
+            tables: map.into_values().collect(),
         }
     }
 
-    pub fn into_json(self) -> SubscriptionUpdateJson {
-        // For all tables, push all state
-        // TODO: We need some way to namespace tables so we don't send all the internal tables and stuff
-        SubscriptionUpdateJson {
-            table_updates: self
-                .tables
-                .into_iter()
-                .map(|table| TableUpdateJson {
-                    table_id: table.table_id,
-                    table_name: table.table_name,
-                    table_row_operations: table
-                        .ops
-                        .into_iter()
-                        .map(|op| {
-                            let row_pk = BASE_64_STD.encode(&op.row_pk);
-                            TableRowOperationJson {
-                                op: if op.op_type == 1 {
-                                    "insert".into()
-                                } else {
-                                    "delete".into()
-                                },
-                                row_pk,
-                                row: op.row.elements,
-                            }
-                        })
-                        .collect(),
-                })
-                .collect(),
-        }
+    /// The number of rows in the payload
+    pub fn num_rows(&self) -> usize {
+        self.tables.iter().map(|t| t.inserts.len() + t.deletes.len()).sum()
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DatabaseTableUpdate {
-    pub table_id: u32,
-    pub table_name: String,
-    pub ops: Vec<TableOp>,
+    pub table_id: TableId,
+    pub table_name: Box<str>,
+    // Note: `Arc<[ProductValue]>` allows to cheaply
+    // use the values from `TxData` without cloning the
+    // contained `ProductValue`s.
+    pub inserts: Arc<[ProductValue]>,
+    pub deletes: Arc<[ProductValue]>,
 }
 
-#[derive(Debug, Clone)]
-pub struct TableOp {
-    pub op_type: u8,
-    pub row_pk: Vec<u8>,
-    pub row: ProductValue,
+#[derive(Debug)]
+pub struct DatabaseUpdateRelValue<'a> {
+    pub tables: Vec<DatabaseTableUpdateRelValue<'a>>,
+}
+
+#[derive(PartialEq, Debug)]
+pub struct DatabaseTableUpdateRelValue<'a> {
+    pub table_id: TableId,
+    pub table_name: Box<str>,
+    pub updates: UpdatesRelValue<'a>,
+}
+
+#[derive(Default, PartialEq, Debug)]
+pub struct UpdatesRelValue<'a> {
+    pub deletes: Vec<RelValue<'a>>,
+    pub inserts: Vec<RelValue<'a>>,
+}
+
+impl UpdatesRelValue<'_> {
+    /// Returns whether there are any updates.
+    pub fn has_updates(&self) -> bool {
+        !(self.deletes.is_empty() && self.inserts.is_empty())
+    }
+
+    pub fn encode<F: WebsocketFormat>(&self, compression: Compression) -> (F::QueryUpdate, u64) {
+        let (deletes, nr_del) = F::encode_list(self.deletes.iter());
+        let (inserts, nr_ins) = F::encode_list(self.inserts.iter());
+        let num_rows = nr_del + nr_ins;
+        let qu = QueryUpdate { deletes, inserts };
+        let cqu = F::into_query_update(qu, compression);
+        (cqu, num_rows)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -171,9 +154,10 @@ impl EventStatus {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ModuleFunctionCall {
     pub reducer: String,
+    pub reducer_id: ReducerId,
     pub args: ArgsTuple,
 }
 
@@ -181,151 +165,305 @@ pub struct ModuleFunctionCall {
 pub struct ModuleEvent {
     pub timestamp: Timestamp,
     pub caller_identity: Identity,
+    pub caller_address: Option<Address>,
     pub function_call: ModuleFunctionCall,
     pub status: EventStatus,
-    pub energy_quanta_used: EnergyDiff,
+    pub energy_quanta_used: EnergyQuanta,
     pub host_execution_duration: Duration,
+    pub request_id: Option<RequestId>,
+    pub timer: Option<Instant>,
 }
 
+/// Information about a running module.
 #[derive(Debug)]
-enum ModuleHostCommand {
-    CallConnectDisconnect {
-        caller_identity: Identity,
-        connected: bool,
-        respond_to: oneshot::Sender<()>,
-    },
-    CallReducer {
-        caller_identity: Identity,
-        client: Option<ClientConnectionSender>,
-        reducer_id: usize,
-        args: ArgsTuple,
-        respond_to: oneshot::Sender<ReducerCallResult>,
-    },
-    InitDatabase {
-        args: ArgsTuple,
-        respond_to: oneshot::Sender<anyhow::Result<ReducerCallResult>>,
-    },
-    UpdateDatabase {
-        respond_to: oneshot::Sender<Result<UpdateDatabaseResult, anyhow::Error>>,
-    },
-    #[cfg(feature = "tracelogging")]
-    GetTrace {
-        respond_to: oneshot::Sender<Option<bytes::Bytes>>,
-    },
-    #[cfg(feature = "tracelogging")]
-    StopTrace {
-        respond_to: oneshot::Sender<anyhow::Result<()>>,
-    },
-    InjectLogs {
-        respond_to: oneshot::Sender<()>,
-        log_level: LogLevel,
-        message: String,
-    },
+pub struct ModuleInfo {
+    /// The definition of the module.
+    /// Loaded by loading the module's program from the system tables, extracting its definition,
+    /// and validating.
+    pub module_def: ModuleDef,
+    /// Map between reducer IDs and reducer names.
+    /// Reducer names are sorted alphabetically.
+    pub reducers_map: ReducersMap,
+    /// The identity of the module.
+    pub owner_identity: Identity,
+    /// The identity of the database.
+    pub database_identity: Identity,
+    /// The hash of the module.
+    pub module_hash: Hash,
+    /// Allows subscribing to module logs.
+    pub log_tx: tokio::sync::broadcast::Sender<bytes::Bytes>,
+    /// Subscriptions to this module.
+    pub subscriptions: ModuleSubscriptions,
 }
 
-impl ModuleHostCommand {
-    fn dispatch<T: ModuleHostActor + ?Sized>(self, actor: &mut T) {
-        match self {
-            ModuleHostCommand::CallConnectDisconnect {
-                caller_identity,
-                connected,
-                respond_to,
-            } => actor.call_connect_disconnect(caller_identity, connected, respond_to),
-            ModuleHostCommand::CallReducer {
-                caller_identity,
-                client,
-                reducer_id,
-                args,
-                respond_to,
-            } => actor.call_reducer(caller_identity, client, reducer_id, args, respond_to),
-            ModuleHostCommand::InitDatabase { args, respond_to } => actor.init_database(args, respond_to),
-            ModuleHostCommand::UpdateDatabase { respond_to } => actor.update_database(respond_to),
-            #[cfg(feature = "tracelogging")]
-            ModuleHostCommand::GetTrace { respond_to } => {
-                let _ = respond_to.send(actor.get_trace());
-            }
-            #[cfg(feature = "tracelogging")]
-            ModuleHostCommand::StopTrace { respond_to } => {
-                let _ = respond_to.send(actor.stop_trace());
-            }
-            ModuleHostCommand::InjectLogs {
-                respond_to,
-                log_level,
-                message,
-            } => actor.inject_logs(respond_to, log_level, message),
+impl ModuleInfo {
+    /// Create a new `ModuleInfo`.
+    /// Reducers are sorted alphabetically by name and assigned IDs.
+    pub fn new(
+        module_def: ModuleDef,
+        owner_identity: Identity,
+        database_identity: Identity,
+        module_hash: Hash,
+        log_tx: tokio::sync::broadcast::Sender<bytes::Bytes>,
+        subscriptions: ModuleSubscriptions,
+    ) -> Arc<Self> {
+        // Note: sorts alphabetically!
+        let reducers_map = module_def.reducers().map(|r| &*r.name).collect();
+        Arc::new(ModuleInfo {
+            module_def,
+            reducers_map,
+            owner_identity,
+            database_identity,
+            module_hash,
+            log_tx,
+            subscriptions,
+        })
+    }
+
+    /// Get the reducer seed and ID for a reducer name, if any.
+    pub fn reducer_seed_and_id(&self, reducer_name: &str) -> Option<(ReducerArgsDeserializeSeed, ReducerId)> {
+        let seed = self.module_def.reducer_arg_deserialize_seed(reducer_name)?;
+        let reducer_id = self
+            .reducers_map
+            .lookup_id(reducer_name)
+            .expect("seed was present, so ID should be present!");
+        Some((seed, reducer_id))
+    }
+
+    /// Get a reducer by its ID.
+    pub fn get_reducer_by_id(&self, reducer_id: ReducerId) -> Option<&ReducerDef> {
+        let name = self.reducers_map.lookup_name(reducer_id)?;
+        Some(
+            self.module_def
+                .reducer(name)
+                .expect("id was present, so reducer should be present!"),
+        )
+    }
+}
+
+/// A bidirectional map between `Identifiers` (reducer names) and `ReducerId`s.
+/// Invariant: the reducer names are in the same order as they were declared in the `ModuleDef`.
+pub struct ReducersMap(IndexSet<Box<str>>);
+
+impl<'a> FromIterator<&'a str> for ReducersMap {
+    fn from_iter<T: IntoIterator<Item = &'a str>>(iter: T) -> Self {
+        Self(iter.into_iter().map_into().collect())
+    }
+}
+
+impl fmt::Debug for ReducersMap {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl ReducersMap {
+    /// Lookup the ID for a reducer name.
+    pub fn lookup_id(&self, reducer_name: &str) -> Option<ReducerId> {
+        self.0.get_index_of(reducer_name).map(ReducerId::from)
+    }
+
+    /// Lookup the name for a reducer ID.
+    pub fn lookup_name(&self, reducer_id: ReducerId) -> Option<&str> {
+        let result = self.0.get_index(reducer_id.0 as _)?;
+        Some(&**result)
+    }
+}
+
+pub trait Module: Send + Sync + 'static {
+    type Instance: ModuleInstance;
+    type InitialInstances<'a>: IntoIterator<Item = Self::Instance> + 'a;
+    fn initial_instances(&mut self) -> Self::InitialInstances<'_>;
+    fn info(&self) -> Arc<ModuleInfo>;
+    fn create_instance(&self) -> Self::Instance;
+    fn replica_ctx(&self) -> &ReplicaContext;
+    fn close(self);
+    #[cfg(feature = "tracelogging")]
+    fn get_trace(&self) -> Option<bytes::Bytes>;
+    #[cfg(feature = "tracelogging")]
+    fn stop_trace(&self) -> anyhow::Result<()>;
+}
+
+pub trait ModuleInstance: Send + 'static {
+    fn trapped(&self) -> bool;
+
+    /// If the module instance's replica_ctx is uninitialized, initialize it.
+    fn init_database(&mut self, program: Program) -> anyhow::Result<Option<ReducerCallResult>>;
+
+    /// Update the module instance's database to match the schema of the module instance.
+    fn update_database(
+        &mut self,
+        program: Program,
+        old_module_info: Arc<ModuleInfo>,
+    ) -> anyhow::Result<UpdateDatabaseResult>;
+
+    fn call_reducer(&mut self, tx: Option<MutTxId>, params: CallReducerParams) -> ReducerCallResult;
+}
+
+pub struct CallReducerParams {
+    pub timestamp: Timestamp,
+    pub caller_identity: Identity,
+    pub caller_address: Address,
+    pub client: Option<Arc<ClientConnectionSender>>,
+    pub request_id: Option<RequestId>,
+    pub timer: Option<Instant>,
+    pub reducer_id: ReducerId,
+    pub args: ArgsTuple,
+}
+
+// TODO: figure out how we want to handle traps. maybe it should just not return to the LendingPool and
+//       let the get_instance logic handle it?
+struct AutoReplacingModuleInstance<T: Module> {
+    inst: LentResource<T::Instance>,
+    module: Arc<T>,
+}
+
+impl<T: Module> AutoReplacingModuleInstance<T> {
+    fn check_trap(&mut self) {
+        if self.inst.trapped() {
+            *self.inst = self.module.create_instance()
         }
     }
 }
 
-#[derive(Debug)]
-enum CmdOrExit {
-    Cmd(ModuleHostCommand),
-    Exit,
-}
-
-#[derive(Debug)]
-pub struct ModuleInfo {
-    pub identity: Identity,
-    pub module_hash: Hash,
-    pub typespace: Typespace,
-    pub reducers: IndexMap<String, ReducerDef>,
-    pub catalog: HashMap<String, EntityDef>,
-    pub log_tx: tokio::sync::broadcast::Sender<bytes::Bytes>,
-    pub subscription: ModuleSubscriptionManager,
-}
-
-pub trait ModuleHostActor: Send + 'static {
-    fn info(&self) -> Arc<ModuleInfo>;
-    fn call_connect_disconnect(&mut self, caller_identity: Identity, connected: bool, respond_to: oneshot::Sender<()>);
-    fn call_reducer(
+impl<T: Module> ModuleInstance for AutoReplacingModuleInstance<T> {
+    fn trapped(&self) -> bool {
+        self.inst.trapped()
+    }
+    fn init_database(&mut self, program: Program) -> anyhow::Result<Option<ReducerCallResult>> {
+        let ret = self.inst.init_database(program);
+        self.check_trap();
+        ret
+    }
+    fn update_database(
         &mut self,
-        caller_identity: Identity,
-        client: Option<ClientConnectionSender>,
-        reducer_id: usize,
-        args: ArgsTuple,
-        respond_to: oneshot::Sender<ReducerCallResult>,
-    );
-    fn init_database(&mut self, args: ArgsTuple, respond_to: oneshot::Sender<Result<ReducerCallResult, anyhow::Error>>);
-    fn update_database(&mut self, respond_to: oneshot::Sender<Result<UpdateDatabaseResult, anyhow::Error>>);
-    #[cfg(feature = "tracelogging")]
-    fn get_trace(&self) -> Option<bytes::Bytes>;
-    #[cfg(feature = "tracelogging")]
-    fn stop_trace(&mut self) -> Result<(), anyhow::Error>;
-    fn inject_logs(&self, respond_to: oneshot::Sender<()>, log_level: LogLevel, message: String);
-    fn close(self);
+        program: Program,
+        old_module_info: Arc<ModuleInfo>,
+    ) -> anyhow::Result<UpdateDatabaseResult> {
+        let ret = self.inst.update_database(program, old_module_info);
+        self.check_trap();
+        ret
+    }
+    fn call_reducer(&mut self, tx: Option<MutTxId>, params: CallReducerParams) -> ReducerCallResult {
+        let ret = self.inst.call_reducer(tx, params);
+        self.check_trap();
+        ret
+    }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ModuleHost {
-    info: Arc<ModuleInfo>,
-    tx: mpsc::Sender<CmdOrExit>,
+    pub info: Arc<ModuleInfo>,
+    inner: Arc<dyn DynModuleHost>,
+    /// Called whenever a reducer call on this host panics.
+    on_panic: Arc<dyn Fn() + Send + Sync + 'static>,
+}
+
+impl fmt::Debug for ModuleHost {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ModuleHost")
+            .field("info", &self.info)
+            .field("inner", &Arc::as_ptr(&self.inner))
+            .finish()
+    }
+}
+
+#[async_trait::async_trait]
+trait DynModuleHost: Send + Sync + 'static {
+    async fn get_instance(&self, db: Identity) -> Result<Box<dyn ModuleInstance>, NoSuchModule>;
+    fn replica_ctx(&self) -> &ReplicaContext;
+    fn exit(&self) -> Closed<'_>;
+    fn exited(&self) -> Closed<'_>;
+}
+
+struct HostControllerActor<T: Module> {
+    module: Arc<T>,
+    instance_pool: LendingPool<T::Instance>,
+}
+
+impl<T: Module> HostControllerActor<T> {
+    fn spinup_new_instance(&self) {
+        let (module, instance_pool) = (self.module.clone(), self.instance_pool.clone());
+        rayon::spawn(move || {
+            let instance = module.create_instance();
+            match instance_pool.add(instance) {
+                Ok(()) => {}
+                Err(PoolClosed) => {
+                    // if the module closed since this new instance was requested, oh well, just throw it away
+                }
+            }
+        })
+    }
+}
+
+/// runs future A and future B concurrently. if A completes before B, B is cancelled. if B completes
+/// before A, A is polled to completion
+async fn select_first<A: Future, B: Future<Output = ()>>(fut_a: A, fut_b: B) -> A::Output {
+    tokio::select! {
+        ret = fut_a => ret,
+        Err(x) = fut_b.never_error() => match x {},
+    }
+}
+
+#[async_trait::async_trait]
+impl<T: Module> DynModuleHost for HostControllerActor<T> {
+    async fn get_instance(&self, db: Identity) -> Result<Box<dyn ModuleInstance>, NoSuchModule> {
+        // in the future we should do something like in the else branch here -- add more instances based on load.
+        // we need to do write-skew retries first - right now there's only ever once instance per module.
+        let inst = if true {
+            self.instance_pool
+                .request_with_context(db)
+                .await
+                .map_err(|_| NoSuchModule)?
+        } else {
+            const GET_INSTANCE_TIMEOUT: Duration = Duration::from_millis(500);
+            select_first(
+                self.instance_pool.request_with_context(db),
+                tokio::time::sleep(GET_INSTANCE_TIMEOUT).map(|()| self.spinup_new_instance()),
+            )
+            .await
+            .map_err(|_| NoSuchModule)?
+        };
+        Ok(Box::new(AutoReplacingModuleInstance {
+            inst,
+            module: self.module.clone(),
+        }))
+    }
+
+    fn replica_ctx(&self) -> &ReplicaContext {
+        self.module.replica_ctx()
+    }
+
+    fn exit(&self) -> Closed<'_> {
+        self.instance_pool.close()
+    }
+
+    fn exited(&self) -> Closed<'_> {
+        self.instance_pool.closed()
+    }
 }
 
 pub struct WeakModuleHost {
     info: Arc<ModuleInfo>,
-    tx: mpsc::WeakSender<CmdOrExit>,
+    inner: Weak<dyn DynModuleHost>,
+    on_panic: Weak<dyn Fn() + Send + Sync + 'static>,
 }
-
-pub type UpdateDatabaseResult = Result<UpdateDatabaseSuccess, UpdateDatabaseError>;
 
 #[derive(Debug)]
-pub struct UpdateDatabaseSuccess {
-    /// Outcome of calling the module's __update__ reducer, `None` if none is
-    /// defined.
-    pub update_result: Option<ReducerCallResult>,
-    /// Outcome of calling the module's pending __migrate__ reducers, empty if
-    /// none are defined or pending.
-    ///
-    /// Currently always empty, as __migrate__ is not yet supported.
-    pub migrate_results: Vec<ReducerCallResult>,
+pub enum UpdateDatabaseResult {
+    NoUpdateNeeded,
+    UpdatePerformed,
+    AutoMigrateError(ErrorStream<AutoMigrateError>),
+    ErrorExecutingMigration(anyhow::Error),
 }
-
-#[derive(thiserror::Error, Debug)]
-pub enum UpdateDatabaseError {
-    #[error("incompatible schema changes for: {tables:?}")]
-    IncompatibleSchema { tables: Vec<String> },
-    #[error(transparent)]
-    Database(#[from] DBError),
+impl UpdateDatabaseResult {
+    /// Check if a database update was successful.
+    pub fn was_successful(&self) -> bool {
+        matches!(
+            self,
+            UpdateDatabaseResult::UpdatePerformed | UpdateDatabaseResult::NoUpdateNeeded
+        )
+    }
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -340,6 +478,8 @@ pub enum ReducerCallError {
     NoSuchModule(#[from] NoSuchModule),
     #[error("no such reducer")]
     NoSuchReducer,
+    #[error("no such scheduled reducer")]
+    ScheduleReducerNotFound,
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -352,36 +492,17 @@ pub enum InitDatabaseError {
     Other(anyhow::Error),
 }
 
-pub struct ModuleStarter {
-    tx: oneshot::Sender<Infallible>,
-}
-
-impl ModuleStarter {
-    pub fn start(self) {
-        drop(self.tx)
-    }
-}
-
 impl ModuleHost {
-    pub fn spawn(actor: impl ModuleHostActor) -> (Self, ModuleStarter) {
-        let (tx, rx) = mpsc::channel(8);
-        let (start_tx, start_rx) = oneshot::channel();
-        let info = actor.info();
-        tokio::task::spawn_blocking(|| {
-            let _ = start_rx.blocking_recv();
-            Self::run_actor(rx, actor)
+    pub fn new(mut module: impl Module, on_panic: impl Fn() + Send + Sync + 'static) -> Self {
+        let info = module.info();
+        let instance_pool = LendingPool::new();
+        instance_pool.add_multiple(module.initial_instances()).unwrap();
+        let inner = Arc::new(HostControllerActor {
+            module: Arc::new(module),
+            instance_pool,
         });
-        (ModuleHost { info, tx }, ModuleStarter { tx: start_tx })
-    }
-
-    fn run_actor(mut rx: mpsc::Receiver<CmdOrExit>, mut actor: impl ModuleHostActor) {
-        while let Some(command) = rx.blocking_recv() {
-            match command {
-                CmdOrExit::Cmd(command) => command.dispatch(&mut actor),
-                CmdOrExit::Exit => rx.close(),
-            }
-        }
-        actor.close()
+        let on_panic = Arc::new(on_panic);
+        ModuleHost { info, inner, on_panic }
     }
 
     #[inline]
@@ -390,191 +511,403 @@ impl ModuleHost {
     }
 
     #[inline]
-    pub fn subscription(&self) -> &ModuleSubscriptionManager {
-        &self.info.subscription
+    pub fn subscriptions(&self) -> &ModuleSubscriptions {
+        &self.info.subscriptions
     }
 
-    async fn call<T>(&self, f: impl FnOnce(oneshot::Sender<T>) -> ModuleHostCommand) -> Result<T, NoSuchModule> {
-        let permit = self.tx.reserve().await.map_err(|_| NoSuchModule)?;
-        let (tx, rx) = oneshot::channel();
-        permit.send(CmdOrExit::Cmd(f(tx)));
-        Ok(rx.await.expect("task panicked"))
+    async fn call<F, R>(&self, reducer: &str, f: F) -> Result<R, NoSuchModule>
+    where
+        F: FnOnce(&mut dyn ModuleInstance) -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        let mut inst = {
+            // Record the time spent waiting in the queue
+            let _guard = WORKER_METRICS
+                .reducer_wait_time
+                .with_label_values(&self.info.database_identity, reducer)
+                .start_timer();
+            self.inner.get_instance(self.info.database_identity).await?
+        };
+
+        let result = tokio::task::spawn_blocking(move || f(&mut *inst))
+            .await
+            .unwrap_or_else(|e| {
+                log::warn!("reducer `{reducer}` panicked");
+                (self.on_panic)();
+                std::panic::resume_unwind(e.into_panic())
+            });
+        Ok(result)
     }
 
+    pub async fn disconnect_client(&self, client_id: ClientActorId) {
+        let this = self.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            this.subscriptions().remove_subscriber(client_id);
+        })
+        .await;
+        // ignore NoSuchModule; if the module's already closed, that's fine
+        let _ = self
+            .call_identity_connected_disconnected(client_id.identity, client_id.address, false)
+            .await;
+    }
+
+    /// Method is responsible for handling connect/disconnect events.
+    ///
+    /// It ensures pairing up those event in commitlogs
+    /// Though It can also create two entries `__identity_disconnect__`.
+    /// One is to actually run the reducer and another one to delete client from `st_clients`
     pub async fn call_identity_connected_disconnected(
         &self,
         caller_identity: Identity,
+        caller_address: Address,
         connected: bool,
-    ) -> Result<(), NoSuchModule> {
-        self.call(|respond_to| ModuleHostCommand::CallConnectDisconnect {
-            caller_identity,
-            connected,
-            respond_to,
-        })
-        .await
+    ) -> Result<(), ReducerCallError> {
+        let reducer_name = if connected {
+            CLIENT_CONNECTED_DUNDER
+        } else {
+            CLIENT_DISCONNECTED_DUNDER
+        };
+
+        let db = &self.inner.replica_ctx().relational_db;
+        let workload = || {
+            Workload::Reducer(ReducerContext {
+                name: reducer_name.to_owned(),
+                caller_identity,
+                caller_address,
+                timestamp: Timestamp::now(),
+                arg_bsatn: Bytes::new(),
+            })
+        };
+
+        let result = self
+            .call_reducer_inner(
+                caller_identity,
+                Some(caller_address),
+                None,
+                None,
+                None,
+                reducer_name,
+                ReducerArgs::Nullary,
+            )
+            .await
+            .map(drop)
+            .or_else(|e| match e {
+                // If the module doesn't define connected or disconnected, commit
+                // a transaction to update `st_clients` and to ensure we always have those events
+                // paired in the commitlog.
+                //
+                // This is necessary to be able to disconnect clients after a server
+                // crash.
+                ReducerCallError::NoSuchReducer => db
+                    .with_auto_commit(workload(), |mut_tx| {
+                        if connected {
+                            self.update_st_clients(mut_tx, caller_identity, caller_address, connected)
+                        } else {
+                            Ok(())
+                        }
+                    })
+                    .map_err(|err| {
+                        InvalidReducerArguments {
+                            err: err.into(),
+                            reducer: reducer_name.into(),
+                        }
+                        .into()
+                    }),
+                e => Err(e),
+            });
+
+        // Deleting client from `st_clients`does not depend upon result of disconnect reducer hence done in a separate tx.
+        if !connected {
+            let _ = db
+                .with_auto_commit(workload(), |mut_tx| {
+                    self.update_st_clients(mut_tx, caller_identity, caller_address, connected)
+                })
+                .map_err(|e| {
+                    log::error!("st_clients table update failed with params with error: {:?}", e);
+                });
+        }
+        result
     }
 
-    pub async fn call_reducer(
+    fn update_st_clients(
+        &self,
+        mut_tx: &mut MutTxId,
+        caller_identity: Identity,
+        caller_address: Address,
+        connected: bool,
+    ) -> Result<(), DBError> {
+        let db = &*self.inner.replica_ctx().relational_db;
+
+        let row = &StClientRow {
+            identity: caller_identity.into(),
+            address: caller_address.into(),
+        };
+
+        if connected {
+            mut_tx.insert_via_serialize_bsatn(ST_CLIENT_ID, &row).map(|_| ())
+        } else {
+            let row = db
+                .iter_by_col_eq_mut(
+                    mut_tx,
+                    ST_CLIENT_ID,
+                    col_list![StClientFields::Identity, StClientFields::Address],
+                    &algebraic_value::AlgebraicValue::product(row),
+                )?
+                .map(|row_ref| row_ref.pointer())
+                .collect::<SmallVec<[_; 1]>>();
+            db.delete(mut_tx, ST_CLIENT_ID, row);
+            Ok::<(), DBError>(())
+        }
+    }
+
+    async fn call_reducer_inner(
         &self,
         caller_identity: Identity,
-        client: Option<ClientConnectionSender>,
+        caller_address: Option<Address>,
+        client: Option<Arc<ClientConnectionSender>>,
+        request_id: Option<RequestId>,
+        timer: Option<Instant>,
         reducer_name: &str,
         args: ReducerArgs,
     ) -> Result<ReducerCallResult, ReducerCallError> {
-        let found_reducer = self
+        let reducer_seed = self
             .info
-            .reducers
-            .get_full(reducer_name)
-            .ok_or(ReducerCallError::NoSuchReducer);
-        let (reducer_id, _, schema) = match found_reducer {
-            Ok(ok) => ok,
-            Err(err) => {
-                let _ = self.inject_logs(LogLevel::Error, format!(
-                    "External attempt to call nonexistent reducer \"{}\" failed. Have you run `spacetime generate` recently?",
-                    reducer_name
-                )).await;
-                Err(err)?
-            }
-        };
+            .module_def
+            .reducer_arg_deserialize_seed(reducer_name)
+            .ok_or(ReducerCallError::NoSuchReducer)?;
 
-        let args = args.into_tuple(self.info.typespace.with_type(schema));
-        let args = match args {
-            Ok(ok) => ok,
-            Err(err) => {
-                let _ = self.inject_logs(LogLevel::Error, format!(
-                    "External attempt to call reducer \"{}\" failed, invalid arguments.\nThis is likely due to a mismatched client schema, have you run `spacetime generate` recently?",
-                    reducer_name,
-                )).await;
-                Err(err)?
-            }
-        };
+        let reducer_id = self
+            .info
+            .reducers_map
+            .lookup_id(reducer_name)
+            .expect("if we found the seed, we should find the ID!");
 
-        self.call(|respond_to| ModuleHostCommand::CallReducer {
-            caller_identity,
-            client,
-            reducer_id,
-            args,
-            respond_to,
+        let args = args.into_tuple(reducer_seed)?;
+        let caller_address = caller_address.unwrap_or(Address::__DUMMY);
+
+        self.call(reducer_name, move |inst| {
+            inst.call_reducer(
+                None,
+                CallReducerParams {
+                    timestamp: Timestamp::now(),
+                    caller_identity,
+                    caller_address,
+                    client,
+                    request_id,
+                    timer,
+                    reducer_id,
+                    args,
+                },
+            )
         })
         .await
         .map_err(Into::into)
     }
 
-    pub fn catalog(&self) -> Catalog {
-        Catalog(self.info.clone())
+    pub async fn call_reducer(
+        &self,
+        caller_identity: Identity,
+        caller_address: Option<Address>,
+        client: Option<Arc<ClientConnectionSender>>,
+        request_id: Option<RequestId>,
+        timer: Option<Instant>,
+        reducer_name: &str,
+        args: ReducerArgs,
+    ) -> Result<ReducerCallResult, ReducerCallError> {
+        if reducer_name.starts_with("__") && reducer_name.ends_with("__") {
+            return Err(ReducerCallError::NoSuchReducer);
+        }
+        let res = self
+            .call_reducer_inner(
+                caller_identity,
+                caller_address,
+                client,
+                request_id,
+                timer,
+                reducer_name,
+                args,
+            )
+            .await;
+
+        let log_message = match &res {
+            Err(ReducerCallError::NoSuchReducer) => Some(format!(
+                "External attempt to call nonexistent reducer \"{}\" failed. Have you run `spacetime generate` recently?",
+                reducer_name
+            )),
+            Err(ReducerCallError::Args(_)) => Some(format!(
+                "External attempt to call reducer \"{}\" failed, invalid arguments.\n\
+                 This is likely due to a mismatched client schema, have you run `spacetime generate` recently?",
+                reducer_name,
+            )),
+            _ => None,
+        };
+        if let Some(log_message) = log_message {
+            self.inject_logs(LogLevel::Error, &log_message)
+        }
+
+        res
+    }
+
+    // Scheduled reducers require a different function here to call their reducer
+    // because their reducer arguments are stored in the database and need to be fetched
+    // within the same transaction as the reducer call.
+    pub async fn call_scheduled_reducer(
+        &self,
+        call_reducer_params: impl FnOnce(&MutTxId) -> anyhow::Result<Option<CallReducerParams>> + Send + 'static,
+    ) -> Result<ReducerCallResult, ReducerCallError> {
+        let db = self.inner.replica_ctx().relational_db.clone();
+        // scheduled reducer name not fetched yet, anyway this is only for logging purpose
+        const REDUCER: &str = "scheduled_reducer";
+        let module = self.info.clone();
+        self.call(REDUCER, move |inst: &mut dyn ModuleInstance| {
+            let mut tx = db.begin_mut_tx(IsolationLevel::Serializable, Workload::Internal);
+
+            match call_reducer_params(&mut tx) {
+                Ok(Some(params)) => {
+                    // Is necessary to patch the context with the actual calling reducer
+                    let reducer = module
+                        .reducers_map
+                        .lookup_name(params.reducer_id)
+                        .ok_or(ReducerCallError::ScheduleReducerNotFound)?;
+
+                    tx.ctx = ExecutionContext::with_workload(
+                        tx.ctx.database_identity(),
+                        Workload::Reducer(ReducerContext {
+                            name: reducer.into(),
+                            caller_identity: params.caller_identity,
+                            caller_address: params.caller_address,
+                            timestamp: Timestamp::now(),
+                            arg_bsatn: params.args.get_bsatn().clone(),
+                        }),
+                    );
+
+                    Ok(inst.call_reducer(Some(tx), params))
+                }
+                Ok(None) => Err(ReducerCallError::ScheduleReducerNotFound),
+                Err(err) => Err(ReducerCallError::Args(InvalidReducerArguments {
+                    err,
+                    reducer: REDUCER.into(),
+                })),
+            }
+        })
+        .await
+        .unwrap_or_else(|e| Err(e.into()))
+        .map_err(Into::into)
     }
 
     pub fn subscribe_to_logs(&self) -> anyhow::Result<tokio::sync::broadcast::Receiver<bytes::Bytes>> {
         Ok(self.info().log_tx.subscribe())
     }
 
-    pub async fn init_database(&self, args: ReducerArgs) -> Result<ReducerCallResult, InitDatabaseError> {
-        let args = match self.catalog().get_reducer("__init__") {
-            Some(schema) => args.into_tuple(schema)?,
-            _ => ArgsTuple::default(),
-        };
-        self.call(|respond_to| ModuleHostCommand::InitDatabase { args, respond_to })
+    pub async fn init_database(&self, program: Program) -> Result<Option<ReducerCallResult>, InitDatabaseError> {
+        self.call("<init_database>", move |inst| inst.init_database(program))
             .await?
             .map_err(InitDatabaseError::Other)
     }
 
-    pub async fn update_database(&self) -> Result<UpdateDatabaseResult, anyhow::Error> {
-        self.call(|respond_to| ModuleHostCommand::UpdateDatabase { respond_to })
-            .await?
-            .map_err(Into::into)
+    pub async fn update_database(
+        &self,
+        program: Program,
+        old_module_info: Arc<ModuleInfo>,
+    ) -> Result<UpdateDatabaseResult, anyhow::Error> {
+        self.call("<update_database>", move |inst| {
+            inst.update_database(program, old_module_info)
+        })
+        .await?
+        .map_err(Into::into)
     }
 
     pub async fn exit(&self) {
-        // if we can't send, it's already closed :P
-        if self.tx.send(CmdOrExit::Exit).await.is_ok() {
-            self.tx.closed().await;
-        }
+        self.inner.exit().await
     }
 
     pub async fn exited(&self) {
-        self.tx.closed().await
+        self.inner.exited().await
     }
 
-    #[cfg(feature = "tracelogging")]
-    pub async fn get_trace(&self) -> Result<Option<bytes::Bytes>, NoSuchModule> {
-        self.call(|respond_to| ModuleHostCommand::GetTrace { respond_to }).await
-    }
-
-    #[cfg(feature = "tracelogging")]
-    pub async fn stop_trace(&self) -> Result<(), anyhow::Error> {
-        self.call(|respond_to| ModuleHostCommand::StopTrace { respond_to })
-            .await?
-    }
-
-    pub async fn inject_logs(&self, log_level: LogLevel, message: String) -> Result<(), NoSuchModule> {
-        self.call(|respond_to| ModuleHostCommand::InjectLogs {
-            respond_to,
+    pub fn inject_logs(&self, log_level: LogLevel, message: &str) {
+        self.replica_ctx().logger.write(
             log_level,
-            message,
+            &Record {
+                ts: chrono::Utc::now(),
+                target: None,
+                filename: Some("external"),
+                line_number: None,
+                message,
+            },
+            &(),
+        )
+    }
+
+    #[tracing::instrument(skip_all)]
+    pub fn one_off_query<F: WebsocketFormat>(
+        &self,
+        caller_identity: Identity,
+        query: String,
+    ) -> Result<OneOffTable<F>, anyhow::Error> {
+        let replica_ctx = self.replica_ctx();
+        let db = &replica_ctx.relational_db;
+        let auth = AuthCtx::new(replica_ctx.owner_identity, caller_identity);
+        log::debug!("One-off query: {query}");
+
+        db.with_read_only(Workload::Sql, |tx| {
+            let tx = SchemaViewer::new(tx, &auth);
+            let plan = SubscribePlan::compile(&query, &tx)?;
+            check_row_limit(&plan, db, &tx, |plan, tx| estimate_rows_scanned(tx, plan), &auth)?;
+            plan.execute::<_, F>(&DeltaTx::from(&*tx))
+                .map(|(rows, _)| OneOffTable {
+                    table_name: plan.table_name().to_owned().into_boxed_str(),
+                    rows,
+                })
+                .context("One-off queries are not allowed to modify the database")
         })
-        .await
+    }
+
+    /// FIXME(jgilles): this is a temporary workaround for deleting not currently being supported
+    /// for tables without primary keys. It is only used in the benchmarks.
+    /// Note: this doesn't drop the table, it just clears it!
+    pub fn clear_table(&self, table_name: &str) -> Result<(), anyhow::Error> {
+        let db = &*self.replica_ctx().relational_db;
+
+        db.with_auto_commit(Workload::Internal, |tx| {
+            let tables = db.get_all_tables_mut(tx)?;
+            // We currently have unique table names,
+            // so we can assume there's only one table to clear.
+            if let Some(table_id) = tables
+                .iter()
+                .find_map(|t| (&*t.table_name == table_name).then_some(t.table_id))
+            {
+                db.clear_table(tx, table_id)?;
+            }
+            Ok(())
+        })
     }
 
     pub fn downgrade(&self) -> WeakModuleHost {
         WeakModuleHost {
             info: self.info.clone(),
-            tx: self.tx.downgrade(),
+            inner: Arc::downgrade(&self.inner),
+            on_panic: Arc::downgrade(&self.on_panic),
         }
+    }
+
+    pub fn database_info(&self) -> &Database {
+        &self.replica_ctx().database
+    }
+
+    pub(crate) fn replica_ctx(&self) -> &ReplicaContext {
+        self.inner.replica_ctx()
     }
 }
 
 impl WeakModuleHost {
     pub fn upgrade(&self) -> Option<ModuleHost> {
-        let tx = self.tx.upgrade()?;
+        let inner = self.inner.upgrade()?;
+        let on_panic = self.on_panic.upgrade()?;
         Some(ModuleHost {
             info: self.info.clone(),
-            tx,
+            inner,
+            on_panic,
         })
-    }
-}
-
-#[derive(Debug)]
-pub enum EntityDef {
-    Reducer(ReducerDef),
-    Table(TableDef),
-}
-impl EntityDef {
-    pub fn as_reducer(&self) -> Option<&ReducerDef> {
-        match self {
-            Self::Reducer(x) => Some(x),
-            _ => None,
-        }
-    }
-    pub fn as_table(&self) -> Option<&TableDef> {
-        match self {
-            Self::Table(x) => Some(x),
-            _ => None,
-        }
-    }
-}
-
-#[derive(Debug)]
-pub struct Catalog(Arc<ModuleInfo>);
-impl Catalog {
-    pub fn typespace(&self) -> &Typespace {
-        &self.0.typespace
-    }
-
-    pub fn get(&self, name: &str) -> Option<WithTypespace<'_, EntityDef>> {
-        self.0.catalog.get(name).map(|ty| self.0.typespace.with_type(ty))
-    }
-    pub fn get_reducer(&self, name: &str) -> Option<WithTypespace<'_, ReducerDef>> {
-        let schema = self.get(name)?;
-        Some(schema.with(schema.ty().as_reducer()?))
-    }
-    pub fn get_table(&self, name: &str) -> Option<WithTypespace<'_, TableDef>> {
-        let schema = self.get(name)?;
-        Some(schema.with(schema.ty().as_table()?))
-    }
-    pub fn iter(&self) -> impl Iterator<Item = (&str, WithTypespace<'_, EntityDef>)> + '_ {
-        self.0
-            .catalog
-            .iter()
-            .map(|(name, e)| (&**name, self.0.typespace.with_type(e)))
     }
 }

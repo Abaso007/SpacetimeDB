@@ -1,31 +1,33 @@
-use std::time::Duration;
-
 use anyhow::Context;
 use bytes::Bytes;
 use bytestring::ByteString;
+use derive_more::Display;
+use enum_map::Enum;
+use once_cell::sync::OnceCell;
+use spacetimedb_lib::bsatn;
 use spacetimedb_lib::de::serde::SeedWrapper;
 use spacetimedb_lib::de::DeserializeSeed;
-use spacetimedb_lib::{bsatn, Hash, Identity};
-use spacetimedb_lib::{ProductValue, ReducerDef};
-use spacetimedb_sats::WithTypespace;
+use spacetimedb_lib::ProductValue;
+use spacetimedb_schema::def::deserialize::ReducerArgsDeserializeSeed;
 
+mod disk_storage;
 mod host_controller;
-pub(crate) mod module_host;
-pub use module_host::{UpdateDatabaseError, UpdateDatabaseResult, UpdateDatabaseSuccess};
+#[allow(clippy::too_many_arguments)]
+pub mod module_host;
 pub mod scheduler;
-mod wasmer;
-
+pub mod wasmtime;
 // Visible for integration testing.
 pub mod instance_env;
-mod timestamp;
-pub mod tracelog;
 mod wasm_common;
 
+pub use disk_storage::DiskStorage;
 pub use host_controller::{
-    DescribedEntityType, EnergyDiff, EnergyQuanta, HostController, ReducerCallResult, ReducerOutcome, UpdateOutcome,
+    DescribedEntityType, DurabilityProvider, ExternalDurability, ExternalStorage, HostController, ProgramStorage,
+    ReducerCallResult, ReducerOutcome,
 };
-pub use module_host::{ModuleHost, NoSuchModule};
-pub use timestamp::Timestamp;
+pub use module_host::{ModuleHost, NoSuchModule, ReducerCallError, UpdateDatabaseResult};
+pub use scheduler::Scheduler;
+pub use spacetimedb_client_api_messages::timestamp::Timestamp;
 
 #[derive(Debug)]
 pub enum ReducerArgs {
@@ -35,27 +37,30 @@ pub enum ReducerArgs {
 }
 
 impl ReducerArgs {
-    fn into_tuple(self, schema: WithTypespace<'_, ReducerDef>) -> Result<ArgsTuple, InvalidReducerArguments> {
-        self._into_tuple(schema).map_err(|err| InvalidReducerArguments {
+    fn into_tuple(self, seed: ReducerArgsDeserializeSeed) -> Result<ArgsTuple, InvalidReducerArguments> {
+        self._into_tuple(seed).map_err(|err| InvalidReducerArguments {
             err,
-            reducer: schema.ty().name.clone(),
+            reducer: (*seed.reducer_def().name).into(),
         })
     }
-    fn _into_tuple(self, schema: WithTypespace<'_, ReducerDef>) -> anyhow::Result<ArgsTuple> {
+    fn _into_tuple(self, seed: ReducerArgsDeserializeSeed) -> anyhow::Result<ArgsTuple> {
         Ok(match self {
             ReducerArgs::Json(json) => ArgsTuple {
-                tuple: from_json_seed(&json, SeedWrapper(ReducerDef::deserialize(schema)))?,
-                bsatn: None,
-                json: Some(json),
+                tuple: from_json_seed(&json, SeedWrapper(seed))?,
+                bsatn: OnceCell::new(),
+                json: OnceCell::with_value(json),
             },
             ReducerArgs::Bsatn(bytes) => ArgsTuple {
-                tuple: ReducerDef::deserialize(schema).deserialize(bsatn::Deserializer::new(&mut &bytes[..]))?,
-                bsatn: Some(bytes),
-                json: None,
+                tuple: seed.deserialize(bsatn::Deserializer::new(&mut &bytes[..]))?,
+                bsatn: OnceCell::with_value(bytes),
+                json: OnceCell::new(),
             },
             ReducerArgs::Nullary => {
-                anyhow::ensure!(schema.ty().args.is_empty(), "failed to typecheck args");
-                ArgsTuple::default()
+                anyhow::ensure!(
+                    seed.reducer_def().params.elements.is_empty(),
+                    "failed to typecheck args"
+                );
+                ArgsTuple::nullary()
             }
         })
     }
@@ -64,18 +69,25 @@ impl ReducerArgs {
 #[derive(Debug, Clone)]
 pub struct ArgsTuple {
     tuple: ProductValue,
-    bsatn: Option<Bytes>,
-    json: Option<ByteString>,
+    bsatn: OnceCell<Bytes>,
+    json: OnceCell<ByteString>,
 }
 
 impl ArgsTuple {
-    pub fn get_bsatn(&mut self) -> &Bytes {
-        self.bsatn
-            .get_or_insert_with(|| bsatn::to_vec(&self.tuple).unwrap().into())
+    pub fn nullary() -> Self {
+        ArgsTuple {
+            tuple: spacetimedb_sats::product![],
+            bsatn: OnceCell::with_value(Bytes::new()),
+            json: OnceCell::with_value(ByteString::from_static("[]")),
+        }
     }
-    pub fn get_json(&mut self) -> &ByteString {
+
+    pub fn get_bsatn(&self) -> &Bytes {
+        self.bsatn.get_or_init(|| bsatn::to_vec(&self.tuple).unwrap().into())
+    }
+    pub fn get_json(&self) -> &ByteString {
         use spacetimedb_sats::ser::serde::SerializeWrapper;
-        self.json.get_or_insert_with(|| {
+        self.json.get_or_init(|| {
             serde_json::to_string(SerializeWrapper::from_ref(&self.tuple))
                 .unwrap()
                 .into()
@@ -85,23 +97,40 @@ impl ArgsTuple {
 
 impl Default for ArgsTuple {
     fn default() -> Self {
-        Self {
-            tuple: spacetimedb_sats::product![],
-            bsatn: Some(Bytes::new()),
-            json: Some("[]".into()),
-        }
+        Self::nullary()
+    }
+}
+
+#[derive(Copy, Clone, Debug, Default)]
+pub struct ReducerId(u32);
+impl std::fmt::Display for ReducerId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+impl From<usize> for ReducerId {
+    fn from(id: usize) -> Self {
+        Self(id as u32)
+    }
+}
+impl From<u32> for ReducerId {
+    fn from(id: u32) -> Self {
+        Self(id)
+    }
+}
+impl From<ReducerId> for u32 {
+    fn from(id: ReducerId) -> Self {
+        id.0
     }
 }
 
 #[derive(thiserror::Error, Debug)]
-#[error("invalid arguments for reducer {reducer}")]
+#[error("invalid arguments for reducer {reducer}: {err}")]
 pub struct InvalidReducerArguments {
     #[source]
     err: anyhow::Error,
-    reducer: String,
+    reducer: Box<str>,
 }
-
-pub use module_host::{EntityDef, ReducerCallError};
 
 fn from_json_seed<'de, T: serde::de::DeserializeSeed<'de>>(s: &'de str, seed: T) -> anyhow::Result<T::Value> {
     let mut de = serde_json::Deserializer::from_str(s);
@@ -113,37 +142,26 @@ fn from_json_seed<'de, T: serde::de::DeserializeSeed<'de>>(s: &'de str, seed: T)
     Ok(out)
 }
 
-pub struct EnergyMonitorFingerprint<'a> {
-    pub module_hash: Hash,
-    pub module_identity: Identity,
-    pub caller_identity: Identity,
-    pub reducer_name: &'a str,
-}
+/// Tags for each call that a `WasmInstanceEnv` can make.
+#[derive(Debug, Display, Enum, Clone, Copy, strum::AsRefStr)]
+pub enum AbiCall {
+    TableIdFromName,
+    IndexIdFromName,
+    DatastoreTableRowCount,
+    DatastoreTableScanBsatn,
+    DatastoreBtreeScanBsatn,
+    RowIterBsatnAdvance,
+    RowIterBsatnClose,
+    DatastoreInsertBsatn,
+    DatastoreUpdateBsatn,
+    DatastoreDeleteByBtreeScanBsatn,
+    DatastoreDeleteAllByEqBsatn,
+    BytesSourceRead,
+    BytesSinkWrite,
+    ConsoleLog,
+    ConsoleTimerStart,
+    ConsoleTimerEnd,
+    Identity,
 
-pub trait EnergyMonitor: Send + Sync + 'static {
-    fn reducer_budget(&self, fingerprint: &EnergyMonitorFingerprint<'_>) -> EnergyQuanta;
-    fn record(&self, fingerprint: &EnergyMonitorFingerprint<'_>, energy_used: EnergyDiff, execution_duration: Duration);
-}
-
-// what would the module do with this information?
-// pub enum EnergyRecordResult {
-//     Continue,
-//     Exhausted { quanta_over_budget: u64 },
-// }
-
-#[derive(Default)]
-pub struct NullEnergyMonitor;
-
-impl EnergyMonitor for NullEnergyMonitor {
-    fn reducer_budget(&self, _fingerprint: &EnergyMonitorFingerprint<'_>) -> EnergyQuanta {
-        EnergyQuanta::DEFAULT_BUDGET
-    }
-
-    fn record(
-        &self,
-        _fingerprint: &EnergyMonitorFingerprint<'_>,
-        _energy_used: EnergyDiff,
-        _execution_duration: Duration,
-    ) {
-    }
+    VolatileNonatomicScheduleImmediate,
 }

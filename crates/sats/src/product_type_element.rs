@@ -1,6 +1,5 @@
 use crate::meta_type::MetaType;
-use crate::{de::Deserialize, ser::Serialize};
-use crate::{AlgebraicType, AlgebraicTypeRef};
+use crate::{AlgebraicType, SpacetimeType, WithTypespace};
 
 /// A factor / element of a product type.
 ///
@@ -8,7 +7,7 @@ use crate::{AlgebraicType, AlgebraicTypeRef};
 ///
 /// NOTE: Each element has an implicit element tag based on its order.
 /// Uniquely identifies an element similarly to protobuf tags.
-#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, SpacetimeType)]
 #[sats(crate = crate)]
 pub struct ProductTypeElement {
     /// The name of the field / element.
@@ -16,7 +15,7 @@ pub struct ProductTypeElement {
     /// As our type system is structural,
     /// a type like `{ foo: U8 }`, where `foo: U8` is the `ProductTypeElement`,
     /// is inequal to `{ bar: U8 }`, although their `algebraic_type`s (`U8`) match.
-    pub name: Option<String>,
+    pub name: Option<Box<str>>,
     /// The type of the element.
     ///
     /// Only values of this type can be stored in the element.
@@ -25,12 +24,12 @@ pub struct ProductTypeElement {
 
 impl ProductTypeElement {
     /// Returns an element with the given `name` and `algebraic_type`.
-    pub const fn new(algebraic_type: AlgebraicType, name: Option<String>) -> Self {
+    pub const fn new(algebraic_type: AlgebraicType, name: Option<Box<str>>) -> Self {
         Self { algebraic_type, name }
     }
 
     /// Returns a named element with `name` and `algebraic_type`.
-    pub fn new_named(algebraic_type: AlgebraicType, name: impl Into<String>) -> Self {
+    pub fn new_named(algebraic_type: AlgebraicType, name: impl Into<Box<str>>) -> Self {
         Self::new(algebraic_type, Some(name.into()))
     }
 
@@ -47,9 +46,9 @@ impl ProductTypeElement {
 
 impl MetaType for ProductTypeElement {
     fn meta_type() -> AlgebraicType {
-        AlgebraicType::product(vec![
-            Self::new_named(AlgebraicType::option(AlgebraicType::String), "name"),
-            Self::new_named(AlgebraicType::Ref(AlgebraicTypeRef(0)), "algebraic_type"),
+        AlgebraicType::product([
+            ("name", AlgebraicType::option(AlgebraicType::String)),
+            ("algebraic_type", AlgebraicType::ZERO_REF),
         ])
     }
 }
@@ -57,5 +56,12 @@ impl MetaType for ProductTypeElement {
 impl From<AlgebraicType> for ProductTypeElement {
     fn from(value: AlgebraicType) -> Self {
         ProductTypeElement::new(value, None)
+    }
+}
+
+impl<'a> WithTypespace<'a, ProductTypeElement> {
+    #[inline]
+    pub fn algebraic_type(&self) -> WithTypespace<'a, AlgebraicType> {
+        self.with(&self.ty().algebraic_type)
     }
 }

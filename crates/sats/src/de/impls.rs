@@ -1,20 +1,17 @@
-use std::borrow::Cow;
-use std::collections::BTreeMap;
-use std::marker::PhantomData;
-
-// use crate::type_value::{ElementValue, EnumValue};
-// use crate::{ProductTypeElement, SumType, PrimitiveType, ReducerDef, ProductType, ProductValue, AlgebraicType, AlgebraicValue};
-
-use crate::builtin_value::{F32, F64};
-use crate::{
-    AlgebraicType, AlgebraicValue, ArrayType, ArrayValue, BuiltinType, BuiltinValue, MapType, MapValue, ProductType,
-    ProductTypeElement, ProductValue, SumType, SumValue, WithTypespace,
-};
-
 use super::{
-    BasicMapVisitor, BasicVecVisitor, Deserialize, DeserializeSeed, Deserializer, Error, FieldNameVisitor, ProductKind,
-    ProductVisitor, SeqProductAccess, SliceVisitor, SumAccess, SumVisitor, VariantAccess, VariantVisitor,
+    BasicSmallVecVisitor, BasicVecVisitor, Deserialize, DeserializeSeed, Deserializer, Error, FieldNameVisitor,
+    ProductKind, ProductVisitor, SeqProductAccess, SliceVisitor, SumAccess, SumVisitor, VariantAccess, VariantVisitor,
 };
+use crate::{
+    de::{array_visit, ArrayAccess, ArrayVisitor, GrowingVec},
+    AlgebraicType, AlgebraicValue, ArrayType, ArrayValue, ProductType, ProductTypeElement, ProductValue, SumType,
+    SumValue, WithTypespace, F32, F64,
+};
+use crate::{i256, u256};
+use core::{marker::PhantomData, ops::Bound};
+use smallvec::SmallVec;
+use spacetimedb_primitives::{ColId, ColList};
+use std::{borrow::Cow, rc::Rc, sync::Arc};
 
 /// Implements [`Deserialize`] for a type in a simplified manner.
 ///
@@ -49,9 +46,9 @@ macro_rules! impl_prim {
 }
 
 impl_prim! {
-    (bool, deserialize_bool) /*(u8, deserialize_u8)*/ (u16, deserialize_u16)
-    (u32, deserialize_u32) (u64, deserialize_u64) (u128, deserialize_u128) (i8, deserialize_i8)
-    (i16, deserialize_i16) (i32, deserialize_i32) (i64, deserialize_i64) (i128, deserialize_i128)
+    (bool, deserialize_bool)
+    /*(u8, deserialize_u8)*/ (u16, deserialize_u16) (u32, deserialize_u32) (u64, deserialize_u64) (u128, deserialize_u128) (u256, deserialize_u256)
+    (i8, deserialize_i8)     (i16, deserialize_i16) (i32, deserialize_i32) (i64, deserialize_i64) (i128, deserialize_i128) (i256, deserialize_i256)
     (f32, deserialize_f32) (f64, deserialize_f64)
 }
 
@@ -100,9 +97,14 @@ impl_deserialize!([] F32, de => f32::deserialize(de).map(Into::into));
 impl_deserialize!([] F64, de => f64::deserialize(de).map(Into::into));
 impl_deserialize!([] String, de => de.deserialize_str(OwnedSliceVisitor));
 impl_deserialize!([T: Deserialize<'de>] Vec<T>, de => T::__deserialize_vec(de));
+impl_deserialize!([T: Deserialize<'de>, const N: usize] SmallVec<[T; N]>, de => {
+    de.deserialize_array(BasicSmallVecVisitor)
+});
 impl_deserialize!([T: Deserialize<'de>, const N: usize] [T; N], de => T::__deserialize_array(de));
 impl_deserialize!([] Box<str>, de => String::deserialize(de).map(|s| s.into_boxed_str()));
 impl_deserialize!([T: Deserialize<'de>] Box<[T]>, de => Vec::deserialize(de).map(|s| s.into_boxed_slice()));
+impl_deserialize!([T: Deserialize<'de>] Rc<[T]>, de => Vec::deserialize(de).map(|s| s.into()));
+impl_deserialize!([T: Deserialize<'de>] Arc<[T]>, de => Vec::deserialize(de).map(|s| s.into()));
 
 /// The visitor converts the slice to its owned version.
 struct OwnedSliceVisitor;
@@ -178,11 +180,6 @@ impl<'de, T: ToOwned + ?Sized + 'de> SliceVisitor<'de, T> for CowSliceVisitor {
     }
 }
 
-impl_deserialize!(
-    [K: Deserialize<'de> + Ord, V: Deserialize<'de>] BTreeMap<K, V>,
-    de => de.deserialize_map(BasicMapVisitor)
-);
-
 impl_deserialize!([T: Deserialize<'de>] Box<T>, de => T::deserialize(de).map(Box::new));
 impl_deserialize!([T: Deserialize<'de>] Option<T>, de => de.deserialize_sum(OptionVisitor(PhantomData)));
 
@@ -238,45 +235,159 @@ impl<'de, T: Deserialize<'de>> VariantVisitor for OptionVisitor<T> {
     }
 }
 
-impl<'de> DeserializeSeed<'de> for WithTypespace<'_, AlgebraicType> {
-    type Output = AlgebraicValue;
+impl_deserialize!([T: Deserialize<'de>, E: Deserialize<'de>] Result<T, E>, de =>
+    de.deserialize_sum(ResultVisitor(PhantomData))
+);
 
-    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Output, D::Error> {
-        match self.ty() {
-            AlgebraicType::Sum(sum) => self.with(sum).deserialize(deserializer).map(AlgebraicValue::Sum),
-            AlgebraicType::Product(prod) => self.with(prod).deserialize(deserializer).map(AlgebraicValue::Product),
-            AlgebraicType::Builtin(b) => self.with(b).deserialize(deserializer).map(AlgebraicValue::Builtin),
-            AlgebraicType::Ref(r) => self.resolve(*r).deserialize(deserializer),
+/// Visitor to deserialize a `Result<T, E>`.
+struct ResultVisitor<T, E>(PhantomData<(T, E)>);
+
+/// Variant determined by the [`VariantVisitor`] for `Result<T, E>`.
+enum ResultVariant {
+    Ok,
+    Err,
+}
+
+impl<'de, T: Deserialize<'de>, E: Deserialize<'de>> SumVisitor<'de> for ResultVisitor<T, E> {
+    type Output = Result<T, E>;
+
+    fn sum_name(&self) -> Option<&str> {
+        Some("result")
+    }
+
+    fn is_option(&self) -> bool {
+        false
+    }
+
+    fn visit_sum<A: SumAccess<'de>>(self, data: A) -> Result<Self::Output, A::Error> {
+        let (variant, data) = data.variant(self)?;
+        Ok(match variant {
+            ResultVariant::Ok => Ok(data.deserialize()?),
+            ResultVariant::Err => Err(data.deserialize()?),
+        })
+    }
+}
+
+impl<'de, T: Deserialize<'de>, U: Deserialize<'de>> VariantVisitor for ResultVisitor<T, U> {
+    type Output = ResultVariant;
+
+    fn variant_names(&self, names: &mut dyn super::ValidNames) {
+        names.extend(["ok", "err"])
+    }
+
+    fn visit_tag<E: Error>(self, tag: u8) -> Result<Self::Output, E> {
+        match tag {
+            0 => Ok(ResultVariant::Ok),
+            1 => Ok(ResultVariant::Err),
+            _ => Err(E::unknown_variant_tag(tag, &self)),
+        }
+    }
+
+    fn visit_name<E: Error>(self, name: &str) -> Result<Self::Output, E> {
+        match name {
+            "ok" => Ok(ResultVariant::Ok),
+            "err" => Ok(ResultVariant::Err),
+            _ => Err(E::unknown_variant_name(name, &self)),
         }
     }
 }
 
-impl<'de> DeserializeSeed<'de> for WithTypespace<'_, BuiltinType> {
-    type Output = BuiltinValue;
+/// The visitor deserializes a `Bound<T>`.
+#[derive(Clone, Copy)]
+pub struct WithBound<S>(pub S);
 
-    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Output, D::Error> {
-        Ok(match self.ty() {
-            BuiltinType::Bool => BuiltinValue::Bool(bool::deserialize(deserializer)?),
-            BuiltinType::I8 => BuiltinValue::I8(i8::deserialize(deserializer)?),
-            BuiltinType::U8 => BuiltinValue::U8(u8::deserialize(deserializer)?),
-            BuiltinType::I16 => BuiltinValue::I16(i16::deserialize(deserializer)?),
-            BuiltinType::U16 => BuiltinValue::U16(u16::deserialize(deserializer)?),
-            BuiltinType::I32 => BuiltinValue::I32(i32::deserialize(deserializer)?),
-            BuiltinType::U32 => BuiltinValue::U32(u32::deserialize(deserializer)?),
-            BuiltinType::I64 => BuiltinValue::I64(i64::deserialize(deserializer)?),
-            BuiltinType::U64 => BuiltinValue::U64(u64::deserialize(deserializer)?),
-            BuiltinType::I128 => BuiltinValue::I128(i128::deserialize(deserializer)?),
-            BuiltinType::U128 => BuiltinValue::U128(u128::deserialize(deserializer)?),
-            BuiltinType::F32 => BuiltinValue::F32(f32::deserialize(deserializer)?.into()),
-            BuiltinType::F64 => BuiltinValue::F64(f64::deserialize(deserializer)?.into()),
-            BuiltinType::String => BuiltinValue::String(String::deserialize(deserializer)?),
-            BuiltinType::Array(ty) => BuiltinValue::Array {
-                val: self.with(ty).deserialize(deserializer)?,
-            },
-            BuiltinType::Map(ty) => BuiltinValue::Map {
-                val: self.with(ty).deserialize(deserializer)?,
-            },
-        })
+impl<'de, S: Copy + DeserializeSeed<'de>> DeserializeSeed<'de> for WithBound<S> {
+    type Output = Bound<S::Output>;
+
+    fn deserialize<D: Deserializer<'de>>(self, de: D) -> Result<Self::Output, D::Error> {
+        de.deserialize_sum(BoundVisitor(self.0))
+    }
+}
+
+/// The visitor deserializes a `Bound<T>`.
+struct BoundVisitor<S>(S);
+
+/// Variant determined by the [`BoundVisitor`] for `Bound<T>`.
+enum BoundVariant {
+    Included,
+    Excluded,
+    Unbounded,
+}
+
+impl<'de, S: Copy + DeserializeSeed<'de>> SumVisitor<'de> for BoundVisitor<S> {
+    type Output = Bound<S::Output>;
+
+    fn sum_name(&self) -> Option<&str> {
+        Some("bound")
+    }
+
+    fn visit_sum<A: SumAccess<'de>>(self, data: A) -> Result<Self::Output, A::Error> {
+        // Determine the variant.
+        let this = self.0;
+        let (variant, data) = data.variant(self)?;
+
+        // Deserialize contents for it.
+        match variant {
+            BoundVariant::Included => data.deserialize_seed(this).map(Bound::Included),
+            BoundVariant::Excluded => data.deserialize_seed(this).map(Bound::Excluded),
+            BoundVariant::Unbounded => data.deserialize::<()>().map(|_| Bound::Unbounded),
+        }
+    }
+}
+
+impl<'de, T: Copy + DeserializeSeed<'de>> VariantVisitor for BoundVisitor<T> {
+    type Output = BoundVariant;
+
+    fn variant_names(&self, names: &mut dyn super::ValidNames) {
+        names.extend(["included", "excluded", "unbounded"])
+    }
+
+    fn visit_tag<E: Error>(self, tag: u8) -> Result<Self::Output, E> {
+        match tag {
+            0 => Ok(BoundVariant::Included),
+            1 => Ok(BoundVariant::Excluded),
+            // if this ever changes, edit crates/bindings/src/table.rs
+            2 => Ok(BoundVariant::Unbounded),
+            _ => Err(E::unknown_variant_tag(tag, &self)),
+        }
+    }
+
+    fn visit_name<E: Error>(self, name: &str) -> Result<Self::Output, E> {
+        match name {
+            "included" => Ok(BoundVariant::Included),
+            "excluded" => Ok(BoundVariant::Excluded),
+            "unbounded" => Ok(BoundVariant::Unbounded),
+            _ => Err(E::unknown_variant_name(name, &self)),
+        }
+    }
+}
+
+impl<'de> DeserializeSeed<'de> for WithTypespace<'_, AlgebraicType> {
+    type Output = AlgebraicValue;
+
+    fn deserialize<D: Deserializer<'de>>(self, de: D) -> Result<Self::Output, D::Error> {
+        match self.ty() {
+            AlgebraicType::Ref(r) => self.resolve(*r).deserialize(de),
+            AlgebraicType::Sum(sum) => self.with(sum).deserialize(de).map(Into::into),
+            AlgebraicType::Product(prod) => self.with(prod).deserialize(de).map(Into::into),
+            AlgebraicType::Array(ty) => self.with(ty).deserialize(de).map(Into::into),
+            AlgebraicType::Bool => bool::deserialize(de).map(Into::into),
+            AlgebraicType::I8 => i8::deserialize(de).map(Into::into),
+            AlgebraicType::U8 => u8::deserialize(de).map(Into::into),
+            AlgebraicType::I16 => i16::deserialize(de).map(Into::into),
+            AlgebraicType::U16 => u16::deserialize(de).map(Into::into),
+            AlgebraicType::I32 => i32::deserialize(de).map(Into::into),
+            AlgebraicType::U32 => u32::deserialize(de).map(Into::into),
+            AlgebraicType::I64 => i64::deserialize(de).map(Into::into),
+            AlgebraicType::U64 => u64::deserialize(de).map(Into::into),
+            AlgebraicType::I128 => i128::deserialize(de).map(Into::into),
+            AlgebraicType::U128 => u128::deserialize(de).map(Into::into),
+            AlgebraicType::I256 => i256::deserialize(de).map(Into::into),
+            AlgebraicType::U256 => u256::deserialize(de).map(Into::into),
+            AlgebraicType::F32 => f32::deserialize(de).map(Into::into),
+            AlgebraicType::F64 => f64::deserialize(de).map(Into::into),
+            AlgebraicType::String => <Box<str>>::deserialize(de).map(Into::into),
+        }
     }
 }
 
@@ -342,26 +453,34 @@ impl<'de> DeserializeSeed<'de> for WithTypespace<'_, ProductType> {
     type Output = ProductValue;
 
     fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Output, D::Error> {
+        deserializer.deserialize_product(self.map(|pt| &*pt.elements))
+    }
+}
+
+impl<'de> DeserializeSeed<'de> for WithTypespace<'_, [ProductTypeElement]> {
+    type Output = ProductValue;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Output, D::Error> {
         deserializer.deserialize_product(self)
     }
 }
 
-impl<'de> ProductVisitor<'de> for WithTypespace<'_, ProductType> {
+impl<'de> ProductVisitor<'de> for WithTypespace<'_, [ProductTypeElement]> {
     type Output = ProductValue;
 
     fn product_name(&self) -> Option<&str> {
         None
     }
     fn product_len(&self) -> usize {
-        self.ty().elements.len()
+        self.ty().len()
     }
 
     fn visit_seq_product<A: SeqProductAccess<'de>>(self, tup: A) -> Result<Self::Output, A::Error> {
-        visit_seq_product(self.map(|ty| &*ty.elements), &self, tup)
+        visit_seq_product(self, &self, tup)
     }
 
     fn visit_named_product<A: super::NamedProductAccess<'de>>(self, tup: A) -> Result<Self::Output, A::Error> {
-        visit_named_product(self.map(|ty| &*ty.elements), &self, tup)
+        visit_named_product(self, &self, tup)
     }
 }
 
@@ -372,9 +491,9 @@ impl<'de> DeserializeSeed<'de> for WithTypespace<'_, ArrayType> {
         /// Deserialize a vector and `map` it to the appropriate `ArrayValue` variant.
         fn de_array<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
             de: D,
-            map: impl FnOnce(Vec<T>) -> ArrayValue,
+            map: impl FnOnce(Box<[T]>) -> ArrayValue,
         ) -> Result<ArrayValue, D::Error> {
-            de.deserialize_array(BasicVecVisitor).map(map)
+            de.deserialize_array(BasicVecVisitor).map(<Box<[_]>>::from).map(map)
         }
 
         let mut ty = &*self.ty().elem_ty;
@@ -389,43 +508,37 @@ impl<'de> DeserializeSeed<'de> for WithTypespace<'_, ArrayType> {
                 }
                 AlgebraicType::Sum(ty) => deserializer
                     .deserialize_array_seed(BasicVecVisitor, self.with(ty))
+                    .map(<Box<[_]>>::from)
                     .map(ArrayValue::Sum),
                 AlgebraicType::Product(ty) => deserializer
                     .deserialize_array_seed(BasicVecVisitor, self.with(ty))
+                    .map(<Box<[_]>>::from)
                     .map(ArrayValue::Product),
-                AlgebraicType::Builtin(BuiltinType::Bool) => de_array(deserializer, ArrayValue::Bool),
-                AlgebraicType::Builtin(BuiltinType::I8) => de_array(deserializer, ArrayValue::I8),
-                AlgebraicType::Builtin(BuiltinType::U8) => {
-                    deserializer.deserialize_bytes(OwnedSliceVisitor).map(ArrayValue::U8)
-                }
-                AlgebraicType::Builtin(BuiltinType::I16) => de_array(deserializer, ArrayValue::I16),
-                AlgebraicType::Builtin(BuiltinType::U16) => de_array(deserializer, ArrayValue::U16),
-                AlgebraicType::Builtin(BuiltinType::I32) => de_array(deserializer, ArrayValue::I32),
-                AlgebraicType::Builtin(BuiltinType::U32) => de_array(deserializer, ArrayValue::U32),
-                AlgebraicType::Builtin(BuiltinType::I64) => de_array(deserializer, ArrayValue::I64),
-                AlgebraicType::Builtin(BuiltinType::U64) => de_array(deserializer, ArrayValue::U64),
-                AlgebraicType::Builtin(BuiltinType::I128) => de_array(deserializer, ArrayValue::I128),
-                AlgebraicType::Builtin(BuiltinType::U128) => de_array(deserializer, ArrayValue::U128),
-                AlgebraicType::Builtin(BuiltinType::F32) => de_array(deserializer, ArrayValue::F32),
-                AlgebraicType::Builtin(BuiltinType::F64) => de_array(deserializer, ArrayValue::F64),
-                AlgebraicType::Builtin(BuiltinType::String) => de_array(deserializer, ArrayValue::String),
-                AlgebraicType::Builtin(BuiltinType::Array(ty)) => deserializer
+                AlgebraicType::Array(ty) => deserializer
                     .deserialize_array_seed(BasicVecVisitor, self.with(ty))
+                    .map(<Box<[_]>>::from)
                     .map(ArrayValue::Array),
-                AlgebraicType::Builtin(BuiltinType::Map(ty)) => deserializer
-                    .deserialize_array_seed(BasicVecVisitor, self.with(ty))
-                    .map(ArrayValue::Map),
+                &AlgebraicType::Bool => de_array(deserializer, ArrayValue::Bool),
+                &AlgebraicType::I8 => de_array(deserializer, ArrayValue::I8),
+                &AlgebraicType::U8 => deserializer
+                    .deserialize_bytes(OwnedSliceVisitor)
+                    .map(<Box<[_]>>::from)
+                    .map(ArrayValue::U8),
+                &AlgebraicType::I16 => de_array(deserializer, ArrayValue::I16),
+                &AlgebraicType::U16 => de_array(deserializer, ArrayValue::U16),
+                &AlgebraicType::I32 => de_array(deserializer, ArrayValue::I32),
+                &AlgebraicType::U32 => de_array(deserializer, ArrayValue::U32),
+                &AlgebraicType::I64 => de_array(deserializer, ArrayValue::I64),
+                &AlgebraicType::U64 => de_array(deserializer, ArrayValue::U64),
+                &AlgebraicType::I128 => de_array(deserializer, ArrayValue::I128),
+                &AlgebraicType::U128 => de_array(deserializer, ArrayValue::U128),
+                &AlgebraicType::I256 => de_array(deserializer, ArrayValue::I256),
+                &AlgebraicType::U256 => de_array(deserializer, ArrayValue::U256),
+                &AlgebraicType::F32 => de_array(deserializer, ArrayValue::F32),
+                &AlgebraicType::F64 => de_array(deserializer, ArrayValue::F64),
+                &AlgebraicType::String => de_array(deserializer, ArrayValue::String),
             };
         }
-    }
-}
-
-impl<'de> DeserializeSeed<'de> for WithTypespace<'_, MapType> {
-    type Output = MapValue;
-
-    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Output, D::Error> {
-        let MapType { key_ty, ty } = self.ty();
-        deserializer.deserialize_map_seed(BasicMapVisitor, self.with(&**key_ty), self.with(&**ty))
     }
 }
 
@@ -546,3 +659,42 @@ impl FieldNameVisitor<'_> for TupleNameVisitor<'_> {
             .ok_or_else(|| Error::unknown_field_name(name, &self))
     }
 }
+
+impl_deserialize!([] spacetimedb_primitives::TableId, de => u32::deserialize(de).map(Self));
+impl_deserialize!([] spacetimedb_primitives::SequenceId, de => u32::deserialize(de).map(Self));
+impl_deserialize!([] spacetimedb_primitives::IndexId, de => u32::deserialize(de).map(Self));
+impl_deserialize!([] spacetimedb_primitives::ConstraintId, de => u32::deserialize(de).map(Self));
+impl_deserialize!([] spacetimedb_primitives::ColId, de => u16::deserialize(de).map(Self));
+impl_deserialize!([] spacetimedb_primitives::ScheduleId, de => u32::deserialize(de).map(Self));
+
+impl GrowingVec<ColId> for ColList {
+    fn with_capacity(cap: usize) -> Self {
+        Self::with_capacity(cap as u16)
+    }
+    fn push(&mut self, elem: ColId) {
+        self.push(elem);
+    }
+}
+impl_deserialize!([] spacetimedb_primitives::ColList, de => {
+    struct ColListVisitor;
+    impl<'de> ArrayVisitor<'de, ColId> for ColListVisitor {
+        type Output = ColList;
+
+        fn visit<A: ArrayAccess<'de, Element = ColId>>(self, vec: A) -> Result<Self::Output, A::Error> {
+            array_visit(vec)
+        }
+    }
+    de.deserialize_array(ColListVisitor)
+});
+impl_deserialize!([] spacetimedb_primitives::ColSet, de => ColList::deserialize(de).map(Into::into));
+
+#[cfg(feature = "blake3")]
+impl_deserialize!([] blake3::Hash, de => <[u8; blake3::OUT_LEN]>::deserialize(de).map(blake3::Hash::from_bytes));
+
+// TODO(perf): integrate Bytes with Deserializer to reduce copying
+impl_deserialize!([] bytes::Bytes, de => <Vec<u8>>::deserialize(de).map(Into::into));
+
+#[cfg(feature = "bytestring")]
+impl_deserialize!([] bytestring::ByteString, de => <String>::deserialize(de).map(Into::into));
+
+impl_deserialize!([] std::time::SystemTime, de => u64::deserialize(de).map(|micros| std::time::SystemTime::UNIX_EPOCH.checked_add(std::time::Duration::from_micros(micros)).unwrap()));

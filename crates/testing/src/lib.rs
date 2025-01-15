@@ -1,18 +1,25 @@
-use std::env;
-use std::path::{Path, PathBuf};
+use clap::Command;
+use spacetimedb_cli::Config;
+use spacetimedb_paths::SpacetimePaths;
 
 pub mod modules;
+pub mod sdk;
 
-pub fn set_key_env_vars() {
-    let set_if_not_exist = |var, path| {
-        if env::var_os(var).is_none() {
-            env::set_var(var, Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").join(path));
-        }
-    };
+#[track_caller]
+pub fn invoke_cli(paths: &SpacetimePaths, args: &[&str]) {
+    lazy_static::lazy_static! {
+        static ref RUNTIME: tokio::runtime::Runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        static ref COMMAND: Command = Command::new("spacetime").no_binary_name(true).subcommands(spacetimedb_cli::get_subcommands());
+    }
+    let config = Config::new_with_localhost(paths.cli_config_dir.cli_toml());
 
-    set_if_not_exist("STDB_PATH", PathBuf::from("/stdb"));
-    set_if_not_exist("SPACETIMEDB_LOGS_PATH", PathBuf::from("/var/log"));
-    set_if_not_exist("SPACETIMEDB_LOG_CONFIG", PathBuf::from("/stdb/log.conf"));
-    set_if_not_exist("SPACETIMEDB_JWT_PUB_KEY", PathBuf::from("/stdb/id_ecdsa.pub"));
-    set_if_not_exist("SPACETIMEDB_JWT_PRIV_KEY", PathBuf::from("/stdb/id_ecdsa"));
+    let args = COMMAND.clone().get_matches_from(args);
+    let (cmd, args) = args.subcommand().expect("Could not split subcommand and args");
+
+    RUNTIME
+        .block_on(spacetimedb_cli::exec_subcommand(config, paths, cmd, args))
+        .unwrap()
 }

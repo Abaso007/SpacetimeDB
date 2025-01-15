@@ -1,6 +1,6 @@
 use clap::{Arg, ArgAction::SetTrue, ArgMatches};
 
-const CLI_VERSION: &str = env!("CARGO_PKG_VERSION");
+pub const CLI_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 use crate::config::Config;
 
@@ -10,7 +10,6 @@ pub fn cli() -> clap::Command {
         .after_help("Run `spacetime help version` for more detailed information.\n")
         .arg(
             Arg::new("cli")
-                .short('c')
                 .long("cli")
                 .action(SetTrue)
                 .help("Prints only the CLI version"),
@@ -23,6 +22,8 @@ pub async fn exec(_config: Config, args: &ArgMatches) -> Result<(), anyhow::Erro
         return Ok(());
     }
 
+    println!("Path: {}", std::env::current_exe()?.display());
+    println!("Commit: {}", env!("GIT_HASH"));
     println!(
         "spacetimedb tool version {}; spacetimedb-lib version {};",
         CLI_VERSION,

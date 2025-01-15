@@ -1,46 +1,40 @@
-use std::collections::HashMap;
-use std::sync::Arc;
-
-use axum::body::Bytes;
-use axum::extract::{DefaultBodyLimit, FromRef, Path, Query, State};
+use crate::auth::{
+    anon_auth_middleware, SpacetimeAuth, SpacetimeAuthHeader, SpacetimeEnergyUsed, SpacetimeExecutionDurationMicros,
+    SpacetimeIdentity, SpacetimeIdentityToken,
+};
+use crate::routes::subscribe::generate_random_address;
+use crate::util::{ByteStringBody, NameOrIdentity};
+use crate::{log_and_500, ControlStateDelegate, DatabaseDef, NodeDelegate};
+use axum::body::{Body, Bytes};
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::response::{ErrorResponse, IntoResponse};
-use axum::{headers, TypedHeader};
+use axum::Extension;
+use axum_extra::TypedHeader;
 use futures::StreamExt;
 use http::StatusCode;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use spacetimedb::host::EntityDef;
-use spacetimedb::host::ReducerArgs;
-use spacetimedb::host::ReducerCallError;
-use spacetimedb::host::ReducerOutcome;
-use spacetimedb::host::UpdateDatabaseSuccess;
-use spacetimedb_lib::name;
-use spacetimedb_lib::name::DomainName;
-use spacetimedb_lib::name::DomainParsingError;
-use spacetimedb_lib::name::PublishOp;
-use spacetimedb_lib::sats::WithTypespace;
-
-use crate::auth::{
-    SpacetimeAuth, SpacetimeAuthHeader, SpacetimeEnergyUsed, SpacetimeExecutionDurationMicros, SpacetimeIdentity,
-    SpacetimeIdentityToken,
-};
 use spacetimedb::address::Address;
 use spacetimedb::database_logger::DatabaseLogger;
-use spacetimedb::host::DescribedEntityType;
+use spacetimedb::host::ReducerCallError;
+use spacetimedb::host::ReducerOutcome;
+use spacetimedb::host::{DescribedEntityType, UpdateDatabaseResult};
+use spacetimedb::host::{ModuleHost, ReducerArgs};
 use spacetimedb::identity::Identity;
-use spacetimedb::json::client_api::StmtResultJson;
-use spacetimedb::messages::control_db::{Database, DatabaseInstance, HostType};
+use spacetimedb::messages::control_db::{Database, HostType};
+use spacetimedb_client_api_messages::name::{self, DnsLookupResponse, DomainName, PublishOp, PublishResult};
+use spacetimedb_data_structures::map::HashMap;
+use spacetimedb_lib::address::AddressForUrl;
+use spacetimedb_lib::db::raw_def::v9::RawModuleDefV9;
+use spacetimedb_lib::identity::AuthCtx;
+use spacetimedb_lib::sats::WithTypespace;
+use spacetimedb_lib::ser::serde::SerializeWrapper;
+use spacetimedb_schema::def::{ReducerDef, TableDef};
 
 use super::identity::IdentityForUrl;
-use crate::util::{ByteStringBody, NameOrAddress};
-use crate::{log_and_500, ControlCtx, ControlNodeDelegate, WorkerCtx};
 
-pub(crate) struct DomainParsingRejection(pub(crate) DomainParsingError);
-impl From<DomainParsingError> for DomainParsingRejection {
-    fn from(e: DomainParsingError) -> Self {
-        DomainParsingRejection(e)
-    }
-}
+pub(crate) struct DomainParsingRejection;
+
 impl IntoResponse for DomainParsingRejection {
     fn into_response(self) -> axum::response::Response {
         (StatusCode::BAD_REQUEST, "Unable to parse domain name").into_response()
@@ -49,61 +43,67 @@ impl IntoResponse for DomainParsingRejection {
 
 #[derive(Deserialize)]
 pub struct CallParams {
-    name_or_address: NameOrAddress,
+    name_or_identity: NameOrIdentity,
     reducer: String,
 }
 
-pub async fn call(
-    State(worker_ctx): State<Arc<dyn WorkerCtx>>,
-    auth: SpacetimeAuthHeader,
+#[derive(Deserialize)]
+pub struct CallQueryParams {
+    client_address: Option<AddressForUrl>,
+}
+
+pub async fn call<S: ControlStateDelegate + NodeDelegate>(
+    State(worker_ctx): State<S>,
+    Extension(auth): Extension<SpacetimeAuth>,
     Path(CallParams {
-        name_or_address,
+        name_or_identity: name_or_address,
         reducer,
     }): Path<CallParams>,
+    Query(CallQueryParams { client_address }): Query<CallQueryParams>,
     ByteStringBody(body): ByteStringBody,
 ) -> axum::response::Result<impl IntoResponse> {
-    let SpacetimeAuth {
-        identity: caller_identity,
-        creds: caller_identity_token,
-    } = auth.get_or_create(&*worker_ctx).await?;
+    let caller_identity = auth.identity;
 
     let args = ReducerArgs::Json(body);
 
-    let address = name_or_address.resolve(&*worker_ctx).await?.into();
-    let database = worker_ctx_find_database(&*worker_ctx, &address).await?.ok_or_else(|| {
+    let address = name_or_address.resolve(&worker_ctx).await?.into();
+    let database = worker_ctx_find_database(&worker_ctx, &address).await?.ok_or_else(|| {
         log::error!("Could not find database: {}", address.to_hex());
         (StatusCode::NOT_FOUND, "No such database.")
     })?;
-    let identity = database.identity;
-    let database_instance = worker_ctx
-        .get_leader_database_instance_by_database(database.id)
-        .await
-        .ok_or((
-            StatusCode::NOT_FOUND,
-            "Database instance not scheduled to this node yet.",
-        ))?;
-    let instance_id = database_instance.id;
-    let host = worker_ctx.host_controller();
+    let identity = database.owner_identity;
 
-    let module = match host.get_module_host(instance_id) {
-        Ok(m) => m,
-        Err(_) => {
-            let dbic = worker_ctx
-                .load_module_host_context(database, instance_id)
-                .await
-                .map_err(log_and_500)?;
-            host.spawn_module_host(dbic).await.map_err(log_and_500)?
-        }
-    };
-    let result = match module.call_reducer(caller_identity, None, &reducer, args).await {
-        Ok(rcr) => rcr,
+    let leader = worker_ctx
+        .leader(database.id)
+        .await
+        .map_err(log_and_500)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let module = leader.module().await.map_err(log_and_500)?;
+
+    // HTTP callers always need an address to provide to connect/disconnect,
+    // so generate one if none was provided.
+    let client_address = client_address
+        .map(Address::from)
+        .unwrap_or_else(generate_random_address);
+
+    if let Err(e) = module
+        .call_identity_connected_disconnected(caller_identity, client_address, true)
+        .await
+    {
+        return Err((StatusCode::NOT_FOUND, format!("{:#}", anyhow::anyhow!(e))).into());
+    }
+    let result = match module
+        .call_reducer(caller_identity, Some(client_address), None, None, None, &reducer, args)
+        .await
+    {
+        Ok(rcr) => Ok(rcr),
         Err(e) => {
             let status_code = match e {
                 ReducerCallError::Args(_) => {
                     log::debug!("Attempt to call reducer with invalid arguments");
                     StatusCode::BAD_REQUEST
                 }
-                ReducerCallError::NoSuchModule(_) => StatusCode::NOT_FOUND,
+                ReducerCallError::NoSuchModule(_) | ReducerCallError::ScheduleReducerNotFound => StatusCode::NOT_FOUND,
                 ReducerCallError::NoSuchReducer => {
                     log::debug!("Attempt to call non-existent reducer {}", reducer);
                     StatusCode::NOT_FOUND
@@ -111,19 +111,29 @@ pub async fn call(
             };
 
             log::debug!("Error while invoking reducer {:#}", e);
-            return Err((status_code, format!("{:#}", anyhow::anyhow!(e))).into());
+            Err((status_code, format!("{:#}", anyhow::anyhow!(e))))
         }
     };
 
-    let (status, body) = reducer_outcome_response(&identity, &reducer, result.outcome);
-    Ok((
-        status,
-        TypedHeader(SpacetimeIdentity(caller_identity)),
-        TypedHeader(SpacetimeIdentityToken(caller_identity_token)),
-        TypedHeader(SpacetimeEnergyUsed(result.energy_used)),
-        TypedHeader(SpacetimeExecutionDurationMicros(result.execution_duration)),
-        body,
-    ))
+    if let Err(e) = module
+        .call_identity_connected_disconnected(caller_identity, client_address, false)
+        .await
+    {
+        return Err((StatusCode::NOT_FOUND, format!("{:#}", anyhow::anyhow!(e))).into());
+    }
+
+    match result {
+        Ok(result) => {
+            let (status, body) = reducer_outcome_response(&identity, &reducer, result.outcome);
+            Ok((
+                status,
+                TypedHeader(SpacetimeEnergyUsed(result.energy_used)),
+                TypedHeader(SpacetimeExecutionDurationMicros(result.execution_duration)),
+                body,
+            ))
+        }
+        Err(e) => Err((e.0, e.1).into()),
+    }
 }
 
 fn reducer_outcome_response(identity: &Identity, reducer: &str, outcome: ReducerOutcome) -> (StatusCode, String) {
@@ -147,133 +157,96 @@ fn reducer_outcome_response(identity: &Identity, reducer: &str, outcome: Reducer
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, derive_more::From)]
 pub enum DBCallErr {
     HandlerError(ErrorResponse),
     NoSuchDatabase,
     InstanceNotScheduled,
 }
 
-use chrono::Utc;
-use rand::Rng;
-use spacetimedb::auth::identity::encode_token;
-use spacetimedb::sql::execute::execute;
-use spacetimedb_lib::identity::AuthCtx;
-use spacetimedb_lib::name::{DnsLookupResponse, InsertDomainResult, PublishResult};
-use spacetimedb_lib::recovery::{RecoveryCode, RecoveryCodeResponse};
-use std::convert::From;
+pub enum EntityDef<'a> {
+    Reducer(&'a ReducerDef),
+    Table(&'a TableDef),
+}
 
-impl From<ErrorResponse> for DBCallErr {
-    fn from(error: ErrorResponse) -> Self {
-        DBCallErr::HandlerError(error)
+impl<'a> EntityDef<'a> {
+    fn described_entity_ty(&self) -> DescribedEntityType {
+        match self {
+            EntityDef::Reducer(_) => DescribedEntityType::Reducer,
+            EntityDef::Table(_) => DescribedEntityType::Table,
+        }
+    }
+    fn name(&self) -> &str {
+        match self {
+            EntityDef::Reducer(r) => &r.name[..],
+            EntityDef::Table(t) => &t.name[..],
+        }
     }
 }
 
-pub struct DatabaseInformation {
-    database_instance: DatabaseInstance,
-    auth: SpacetimeAuth,
-}
-/// Extract some common parameters that most API call invocations to the database will use.
-/// TODO(tyler): Ryan originally intended for extract call info to be used for any call that is specific to a
-/// database. However, there are some functions that should be callable from anyone, possibly even if they
-/// don't provide any credentials at all. The problem is that this function doesn't make sense in all places
-/// where credentials are required (e.g. publish), so for now we're just going to keep this as is, but we're
-/// going to generate a new set of credentials if you don't provide them.
-async fn extract_db_call_info(
-    ctx: &dyn WorkerCtx,
-    auth: SpacetimeAuthHeader,
-    address: &Address,
-) -> Result<DatabaseInformation, ErrorResponse> {
-    let auth = auth.get_or_create(ctx).await?;
-
-    let database = worker_ctx_find_database(ctx, address).await?.ok_or_else(|| {
-        log::error!("Could not find database: {}", address.to_hex());
-        (StatusCode::NOT_FOUND, "No such database.")
-    })?;
-
-    let database_instance = ctx.get_leader_database_instance_by_database(database.id).await.ok_or((
-        StatusCode::NOT_FOUND,
-        "Database instance not scheduled to this node yet.",
-    ))?;
-
-    Ok(DatabaseInformation {
-        database_instance,
-        auth,
-    })
-}
-
-fn entity_description_json(description: WithTypespace<EntityDef>, expand: bool) -> Option<Value> {
-    let typ = DescribedEntityType::from_entitydef(description.ty()).as_str();
+fn entity_description_json(description: WithTypespace<EntityDef>) -> Option<Value> {
+    let typ = description.ty().described_entity_ty().as_str();
     let len = match description.ty() {
-        EntityDef::Table(t) => description.resolve(t.data).ty().as_product()?.elements.len(),
-        EntityDef::Reducer(r) => r.args.len(),
+        EntityDef::Table(t) => description
+            .resolve(t.product_type_ref)
+            .ty()
+            .as_product()?
+            .elements
+            .len(),
+        EntityDef::Reducer(r) => r.params.elements.len(),
     };
-    if expand {
-        // TODO(noa): make this less hacky; needs coordination w/ spacetime-web
-        let schema = match description.ty() {
-            EntityDef::Table(table) => {
-                json!(description.with(&table.data).resolve_refs()?.as_product()?)
-            }
-            EntityDef::Reducer(r) => json!({
-                "name": r.name,
-                "elements": r.args,
-            }),
-        };
-        Some(json!({
-            "type": typ,
-            "arity": len,
-            "schema": schema
-        }))
-    } else {
-        Some(json!({
-            "type": typ,
-            "arity": len,
-        }))
-    }
+    // TODO(noa): make this less hacky; needs coordination w/ spacetime-web
+    let schema = match description.ty() {
+        EntityDef::Table(table) => {
+            json!(description
+                .with(&table.product_type_ref)
+                .resolve_refs()
+                .ok()?
+                .as_product()?)
+        }
+        EntityDef::Reducer(r) => json!({
+            "name": &r.name[..],
+            "elements": r.params.elements,
+        }),
+    };
+    Some(json!({
+        "type": typ,
+        "arity": len,
+        "schema": schema
+    }))
 }
 
 #[derive(Deserialize)]
 pub struct DescribeParams {
-    name_or_address: NameOrAddress,
+    name_or_identity: NameOrIdentity,
     entity_type: String,
     entity: String,
 }
 
-#[derive(Deserialize)]
-pub struct DescribeQueryParams {
-    expand: Option<bool>,
-}
-
-pub async fn describe(
-    State(worker_ctx): State<Arc<dyn WorkerCtx>>,
+pub async fn describe<S>(
+    State(worker_ctx): State<S>,
     Path(DescribeParams {
-        name_or_address,
+        name_or_identity,
         entity_type,
         entity,
     }): Path<DescribeParams>,
-    Query(DescribeQueryParams { expand }): Query<DescribeQueryParams>,
-    auth: SpacetimeAuthHeader,
-) -> axum::response::Result<impl IntoResponse> {
-    let address = name_or_address.resolve(&*worker_ctx).await?.into();
-    let database = worker_ctx_find_database(&*worker_ctx, &address)
+    Extension(auth): Extension<SpacetimeAuth>,
+) -> axum::response::Result<impl IntoResponse>
+where
+    S: ControlStateDelegate + NodeDelegate,
+{
+    let address = name_or_identity.resolve(&worker_ctx).await?.into();
+    let database = worker_ctx_find_database(&worker_ctx, &address)
         .await?
         .ok_or((StatusCode::NOT_FOUND, "No such database."))?;
 
-    let call_info = extract_db_call_info(&*worker_ctx, auth, &address).await?;
+    let leader = worker_ctx
+        .leader(database.id)
+        .await
+        .map_err(log_and_500)?
+        .ok_or(StatusCode::NOT_FOUND)?;
 
-    let instance_id = call_info.database_instance.id;
-    let host = worker_ctx.host_controller();
-    let module = match host.get_module_host(instance_id) {
-        Ok(m) => m,
-        Err(_) => {
-            let dbic = worker_ctx
-                .load_module_host_context(database, instance_id)
-                .await
-                .map_err(log_and_500)?;
-            host.spawn_module_host(dbic).await.map_err(log_and_500)?
-        }
-    };
-
+    let module = leader.module().await.map_err(log_and_500)?;
     let entity_type = entity_type.as_str().parse().map_err(|()| {
         log::debug!("Request to describe unhandled entity type: {}", entity_type);
         (
@@ -281,100 +254,120 @@ pub async fn describe(
             format!("Invalid entity type for description: {}", entity_type),
         )
     })?;
-    let catalog = module.catalog();
-    let description = catalog
-        .get(&entity)
-        .filter(|desc| DescribedEntityType::from_entitydef(desc.ty()) == entity_type)
+    let description = get_entity(&module, &entity, entity_type)
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("{entity_type} {entity:?} not found")))?;
+    let description = WithTypespace::new(module.info().module_def.typespace(), &description);
 
-    let expand = expand.unwrap_or(true);
-    let response_json = json!({ entity: entity_description_json(description, expand) });
+    let response_json = json!({ entity: entity_description_json(description) });
 
     Ok((
         StatusCode::OK,
-        TypedHeader(SpacetimeIdentity(call_info.auth.identity)),
-        TypedHeader(SpacetimeIdentityToken(call_info.auth.creds)),
+        TypedHeader(SpacetimeIdentity(auth.identity)),
+        TypedHeader(SpacetimeIdentityToken(auth.creds)),
         axum::Json(response_json),
     ))
 }
 
+fn get_catalog(host: &ModuleHost) -> impl Iterator<Item = EntityDef> {
+    let module_def = &host.info().module_def;
+    module_def
+        .reducers()
+        .map(EntityDef::Reducer)
+        .chain(module_def.tables().map(EntityDef::Table))
+}
+
+fn get_entity<'a>(host: &'a ModuleHost, entity: &'_ str, entity_type: DescribedEntityType) -> Option<EntityDef<'a>> {
+    match entity_type {
+        DescribedEntityType::Table => host.info().module_def.table(entity).map(EntityDef::Table),
+        DescribedEntityType::Reducer => host.info().module_def.reducer(entity).map(EntityDef::Reducer),
+    }
+}
+
 #[derive(Deserialize)]
 pub struct CatalogParams {
-    name_or_address: NameOrAddress,
+    name_or_identity: NameOrIdentity,
 }
-pub async fn catalog(
-    State(worker_ctx): State<Arc<dyn WorkerCtx>>,
-    Path(CatalogParams { name_or_address }): Path<CatalogParams>,
-    Query(DescribeQueryParams { expand }): Query<DescribeQueryParams>,
-    auth: SpacetimeAuthHeader,
-) -> axum::response::Result<impl IntoResponse> {
-    let address = name_or_address.resolve(&*worker_ctx).await?.into();
-    let database = worker_ctx_find_database(&*worker_ctx, &address)
+#[derive(Deserialize)]
+pub struct CatalogQueryParams {
+    #[serde(default)]
+    module_def: bool,
+}
+pub async fn catalog<S>(
+    State(worker_ctx): State<S>,
+    Path(CatalogParams { name_or_identity }): Path<CatalogParams>,
+    Query(CatalogQueryParams { module_def }): Query<CatalogQueryParams>,
+    Extension(auth): Extension<SpacetimeAuth>,
+) -> axum::response::Result<impl IntoResponse>
+where
+    S: ControlStateDelegate + NodeDelegate,
+{
+    let address = name_or_identity.resolve(&worker_ctx).await?.into();
+    let database = worker_ctx_find_database(&worker_ctx, &address)
         .await?
         .ok_or((StatusCode::NOT_FOUND, "No such database."))?;
 
-    let call_info = extract_db_call_info(&*worker_ctx, auth, &address).await?;
+    let leader = worker_ctx
+        .leader(database.id)
+        .await
+        .map_err(log_and_500)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let module = leader.module().await.map_err(log_and_500)?;
 
-    let instance_id = call_info.database_instance.id;
-    let host = worker_ctx.host_controller();
-    let module = match host.get_module_host(instance_id) {
-        Ok(m) => m,
-        Err(_) => {
-            let dbic = worker_ctx
-                .load_module_host_context(database, instance_id)
-                .await
-                .map_err(log_and_500)?;
-            host.spawn_module_host(dbic).await.map_err(log_and_500)?
-        }
+    let response_json = if module_def {
+        let raw = RawModuleDefV9::from(module.info().module_def.clone());
+        serde_json::to_value(SerializeWrapper::from_ref(&raw)).map_err(log_and_500)?
+    } else {
+        let response_catalog: HashMap<_, _> = get_catalog(&module)
+            .map(|entity| {
+                (
+                    entity.name().to_string().into_boxed_str(),
+                    entity_description_json(WithTypespace::new(module.info().module_def.typespace(), &entity)),
+                )
+            })
+            .collect();
+        json!({
+            "entities": response_catalog,
+            "typespace": SerializeWrapper::from_ref(module.info().module_def.typespace()),
+        })
     };
-    let catalog = module.catalog();
-    let expand = expand.unwrap_or(false);
-    let response_catalog: HashMap<_, _> = catalog
-        .iter()
-        .map(|(name, entity)| (name, entity_description_json(entity, expand)))
-        .collect();
-    let response_json = json!({
-        "entities": response_catalog,
-        "typespace": catalog.typespace().types,
-    });
 
     Ok((
         StatusCode::OK,
-        TypedHeader(SpacetimeIdentity(call_info.auth.identity)),
-        TypedHeader(SpacetimeIdentityToken(call_info.auth.creds)),
+        TypedHeader(SpacetimeIdentity(auth.identity)),
+        TypedHeader(SpacetimeIdentityToken(auth.creds)),
         axum::Json(response_json),
     ))
 }
 
 #[derive(Deserialize)]
 pub struct InfoParams {
-    name_or_address: NameOrAddress,
+    name_or_identity: NameOrIdentity,
 }
-pub async fn info(
-    State(worker_ctx): State<Arc<dyn WorkerCtx>>,
-    Path(InfoParams { name_or_address }): Path<InfoParams>,
+pub async fn info<S: ControlStateDelegate>(
+    State(worker_ctx): State<S>,
+    Path(InfoParams { name_or_identity }): Path<InfoParams>,
 ) -> axum::response::Result<impl IntoResponse> {
-    let address = name_or_address.resolve(&*worker_ctx).await?.into();
-    let database = worker_ctx_find_database(&*worker_ctx, &address)
+    log::trace!("Trying to resolve database identity: {:?}", name_or_identity);
+    let database_identity = name_or_identity.resolve(&worker_ctx).await?.into();
+    log::trace!("Resolved identity to: {database_identity:?}");
+    let database = worker_ctx_find_database(&worker_ctx, &database_identity)
         .await?
         .ok_or((StatusCode::NOT_FOUND, "No such database."))?;
+    log::trace!("Fetched database from the worker db for address: {database_identity:?}");
 
-    let host_type = match database.host_type {
-        HostType::Wasmer => "wasmer",
-    };
+    let host_type: &str = database.host_type.as_ref();
     let response_json = json!({
-        "address": database.address.to_hex(),
-        "identity": database.identity.to_hex(),
+        "database_identity": database.database_identity,
+        "owner_identity": database.owner_identity,
         "host_type": host_type,
-        "num_replicas": database.num_replicas,
-        "program_bytes_address": database.program_bytes_address,
+        "initial_program": database.initial_program,
     });
     Ok((StatusCode::OK, axum::Json(response_json)))
 }
 
 #[derive(Deserialize)]
 pub struct LogsParams {
-    name_or_address: NameOrAddress,
+    name_or_identity: NameOrIdentity,
 }
 
 #[derive(Deserialize)]
@@ -384,73 +377,65 @@ pub struct LogsQuery {
     follow: bool,
 }
 
-fn auth_or_unauth(auth: SpacetimeAuthHeader) -> axum::response::Result<SpacetimeAuth> {
-    auth.get()
-        .ok_or((StatusCode::UNAUTHORIZED, "Invalid credentials").into())
-}
-
-pub async fn logs(
-    State(worker_ctx): State<Arc<dyn WorkerCtx>>,
-    Path(LogsParams { name_or_address }): Path<LogsParams>,
+pub async fn logs<S>(
+    State(worker_ctx): State<S>,
+    Path(LogsParams { name_or_identity }): Path<LogsParams>,
     Query(LogsQuery { num_lines, follow }): Query<LogsQuery>,
-    auth: SpacetimeAuthHeader,
-) -> axum::response::Result<impl IntoResponse> {
+    Extension(auth): Extension<SpacetimeAuth>,
+) -> axum::response::Result<impl IntoResponse>
+where
+    S: ControlStateDelegate + NodeDelegate,
+{
     // You should not be able to read the logs from a database that you do not own
     // so, unless you are the owner, this will fail.
-    // TODO: This returns `UNAUTHORIZED` on failure,
-    //       while everywhere else we return `BAD_REQUEST`.
-    //       Is this special in some way? Should this change?
-    //       Should all the others change?
-    let auth = auth_or_unauth(auth)?;
 
-    let address = name_or_address.resolve(&*worker_ctx).await?.into();
-    let database = worker_ctx_find_database(&*worker_ctx, &address)
+    let database_identity: Identity = name_or_identity.resolve(&worker_ctx).await?.into();
+    let database = worker_ctx_find_database(&worker_ctx, &database_identity)
         .await?
         .ok_or((StatusCode::NOT_FOUND, "No such database."))?;
 
-    if database.identity != auth.identity {
+    if database.owner_identity != auth.identity {
         return Err((
             StatusCode::BAD_REQUEST,
             format!(
                 "Identity does not own database, expected: {} got: {}",
-                database.identity.to_hex(),
+                database.owner_identity.to_hex(),
                 auth.identity.to_hex()
             ),
         )
             .into());
     }
 
-    let database_instance = worker_ctx
-        .get_leader_database_instance_by_database(database.id)
-        .await
-        .ok_or((
-            StatusCode::NOT_FOUND,
-            "Database instance not scheduled to this node yet.",
-        ))?;
-    let instance_id = database_instance.id;
+    let replica = worker_ctx
+        .get_leader_replica_by_database(database.id)
+        .ok_or((StatusCode::NOT_FOUND, "Replica not scheduled to this node yet."))?;
+    let replica_id = replica.id;
 
-    let filepath = DatabaseLogger::filepath(&address, instance_id);
-    let lines = DatabaseLogger::read_latest(&filepath, num_lines).await;
+    let logs_dir = worker_ctx.module_logs_dir(replica_id);
+    let lines = DatabaseLogger::read_latest(logs_dir, num_lines).await;
 
     let body = if follow {
-        let host = worker_ctx.host_controller();
-        let module = match host.get_module_host(instance_id) {
-            Ok(m) => m,
-            Err(_) => {
-                let dbic = worker_ctx
-                    .load_module_host_context(database, instance_id)
-                    .await
-                    .map_err(log_and_500)?;
-                host.spawn_module_host(dbic).await.map_err(log_and_500)?
-            }
-        };
-        let log_rx = module.subscribe_to_logs().map_err(log_and_500)?;
+        let leader = worker_ctx
+            .leader(database.id)
+            .await
+            .map_err(log_and_500)?
+            .ok_or(StatusCode::NOT_FOUND)?;
+        let log_rx = leader
+            .module()
+            .await
+            .map_err(log_and_500)?
+            .subscribe_to_logs()
+            .map_err(log_and_500)?;
 
         let stream = tokio_stream::wrappers::BroadcastStream::new(log_rx).filter_map(move |x| {
             std::future::ready(match x {
                 Ok(log) => Some(log),
                 Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(skipped)) => {
-                    log::trace!("Skipped {} lines in log for module {}", skipped, address.to_hex());
+                    log::trace!(
+                        "Skipped {} lines in log for module {}",
+                        skipped,
+                        database_identity.to_hex()
+                    );
                     None
                 }
             })
@@ -460,9 +445,9 @@ pub async fn logs(
             .chain(stream)
             .map(Ok::<_, std::convert::Infallible>);
 
-        axum::body::boxed(axum::body::StreamBody::new(stream))
+        Body::from_stream(stream)
     } else {
-        axum::body::boxed(axum::body::Full::from(lines))
+        Body::from(lines)
     };
 
     Ok((
@@ -478,85 +463,49 @@ fn mime_ndjson() -> mime::Mime {
 }
 
 async fn worker_ctx_find_database(
-    worker_ctx: &dyn WorkerCtx,
-    address: &Address,
-) -> Result<Option<Database>, StatusCode> {
-    worker_ctx.get_database_by_address(address).await.map_err(log_and_500)
+    worker_ctx: &(impl ControlStateDelegate + ?Sized),
+    database_identity: &Identity,
+) -> axum::response::Result<Option<Database>> {
+    worker_ctx
+        .get_database_by_identity(database_identity)
+        .map_err(log_and_500)
 }
 
 #[derive(Deserialize)]
 pub struct SqlParams {
-    name_or_address: NameOrAddress,
+    name_or_identity: NameOrIdentity,
 }
 
 #[derive(Deserialize)]
 pub struct SqlQueryParams {}
 
-pub async fn sql(
-    State(worker_ctx): State<Arc<dyn WorkerCtx>>,
-    Path(SqlParams { name_or_address }): Path<SqlParams>,
+pub async fn sql<S>(
+    State(worker_ctx): State<S>,
+    Path(SqlParams { name_or_identity }): Path<SqlParams>,
     Query(SqlQueryParams {}): Query<SqlQueryParams>,
-    auth: SpacetimeAuthHeader,
+    Extension(auth): Extension<SpacetimeAuth>,
     body: String,
-) -> axum::response::Result<impl IntoResponse> {
+) -> axum::response::Result<impl IntoResponse>
+where
+    S: NodeDelegate + ControlStateDelegate,
+{
     // Anyone is authorized to execute SQL queries. The SQL engine will determine
     // which queries this identity is allowed to execute against the database.
-    let auth = auth.get_or_create(&*worker_ctx).await?;
 
-    let address = name_or_address.resolve(&*worker_ctx).await?.into();
-    let database = worker_ctx_find_database(&*worker_ctx, &address)
+    let address = name_or_identity.resolve(&worker_ctx).await?.into();
+    let database = worker_ctx_find_database(&worker_ctx, &address)
         .await?
         .ok_or((StatusCode::NOT_FOUND, "No such database."))?;
 
-    let auth = AuthCtx::new(database.identity, auth.identity);
+    let auth = AuthCtx::new(database.owner_identity, auth.identity);
     log::debug!("auth: {auth:?}");
-    let database_instance = worker_ctx
-        .get_leader_database_instance_by_database(database.id)
+
+    let host = worker_ctx
+        .leader(database.id)
         .await
-        .ok_or((
-            StatusCode::NOT_FOUND,
-            "Database instance not scheduled to this node yet.",
-        ))?;
-    let instance_id = database_instance.id;
-
-    let host = worker_ctx.host_controller();
-    match host.get_module_host(instance_id) {
-        Ok(_) => {}
-        Err(_) => {
-            let dbic = worker_ctx
-                .load_module_host_context(database, instance_id)
-                .await
-                .map_err(log_and_500)?;
-            host.spawn_module_host(dbic).await.map_err(log_and_500)?;
-        }
-    };
-
-    let results = match execute(
-        worker_ctx.database_instance_context_controller(),
-        instance_id,
-        body,
-        auth,
-    ) {
-        Ok(results) => results,
-        Err(err) => {
-            log::warn!("{}", err);
-            return if let Some(auth_err) = err.get_auth_error() {
-                let err = format!("{auth_err}");
-                Err((StatusCode::UNAUTHORIZED, err).into())
-            } else {
-                let err = format!("{err}");
-                Err((StatusCode::BAD_REQUEST, err).into())
-            };
-        }
-    };
-
-    let json = results
-        .into_iter()
-        .map(|result| StmtResultJson {
-            schema: result.head.ty(),
-            rows: result.data.into_iter().map(|x| x.elements).collect::<Vec<_>>(),
-        })
-        .collect::<Vec<_>>();
+        .map_err(log_and_500)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let json = host.exec_sql(auth, database, body).await?;
 
     Ok((StatusCode::OK, axum::Json(json)))
 }
@@ -568,23 +517,23 @@ pub struct DNSParams {
 
 #[derive(Deserialize)]
 pub struct ReverseDNSParams {
-    database_address: Address,
+    database_identity: IdentityForUrl,
 }
 
 #[derive(Deserialize)]
 pub struct DNSQueryParams {}
 
-pub async fn dns(
-    State(ctx): State<Arc<dyn ControlCtx>>,
+pub async fn dns<S: ControlStateDelegate>(
+    State(ctx): State<S>,
     Path(DNSParams { database_name }): Path<DNSParams>,
     Query(DNSQueryParams {}): Query<DNSQueryParams>,
 ) -> axum::response::Result<impl IntoResponse> {
-    let domain = database_name.parse().map_err(DomainParsingRejection)?;
-    let address = ctx.control_db().spacetime_dns(&domain).await.map_err(log_and_500)?;
-    let response = if let Some(address) = address {
+    let domain = database_name.parse().map_err(|_| DomainParsingRejection)?;
+    let db_identity = ctx.lookup_identity(&domain).map_err(log_and_500)?;
+    let response = if let Some(db_identity) = db_identity {
         DnsLookupResponse::Success {
             domain,
-            address: address.to_hex(),
+            identity: db_identity,
         }
     } else {
         DnsLookupResponse::Failure { domain }
@@ -593,15 +542,13 @@ pub async fn dns(
     Ok(axum::Json(response))
 }
 
-pub async fn reverse_dns(
-    State(ctx): State<Arc<dyn ControlCtx>>,
-    Path(ReverseDNSParams { database_address }): Path<ReverseDNSParams>,
+pub async fn reverse_dns<S: ControlStateDelegate>(
+    State(ctx): State<S>,
+    Path(ReverseDNSParams { database_identity }): Path<ReverseDNSParams>,
 ) -> axum::response::Result<impl IntoResponse> {
-    let names = ctx
-        .control_db()
-        .spacetime_reverse_dns(&database_address)
-        .await
-        .map_err(log_and_500)?;
+    let database_address = Identity::from(database_identity);
+
+    let names = ctx.reverse_lookup(&database_address).map_err(log_and_500)?;
 
     let response = name::ReverseDNSResponse { names };
     Ok(axum::Json(response))
@@ -612,144 +559,17 @@ pub struct RegisterTldParams {
     tld: String,
 }
 
-fn auth_or_bad_request(auth: SpacetimeAuthHeader) -> axum::response::Result<SpacetimeAuth> {
-    auth.get()
-        .ok_or((StatusCode::BAD_REQUEST, "Invalid credentials.").into())
-}
-
-pub async fn register_tld(
-    State(ctx): State<Arc<dyn ControlCtx>>,
+pub async fn register_tld<S: ControlStateDelegate>(
+    State(ctx): State<S>,
     Query(RegisterTldParams { tld }): Query<RegisterTldParams>,
-    auth: SpacetimeAuthHeader,
+    Extension(auth): Extension<SpacetimeAuth>,
 ) -> axum::response::Result<impl IntoResponse> {
     // You should not be able to publish to a database that you do not own
     // so, unless you are the owner, this will fail, hence not using get_or_create
-    let auth = auth_or_bad_request(auth)?;
 
-    let tld = tld.parse::<DomainName>().map_err(DomainParsingRejection)?.into();
-    let result = ctx
-        .control_db()
-        .spacetime_register_tld(tld, auth.identity)
-        .await
-        .map_err(log_and_500)?;
+    let tld = tld.parse::<DomainName>().map_err(|_| DomainParsingRejection)?.into();
+    let result = ctx.register_tld(&auth.identity, tld).await.map_err(log_and_500)?;
     Ok(axum::Json(result))
-}
-
-#[derive(Deserialize)]
-pub struct RequestRecoveryCodeParams {
-    /// Whether or not the client is requesting a login link for a web-login. This is false for CLI logins.
-    #[serde(default)]
-    link: bool,
-    email: String,
-    identity: IdentityForUrl,
-}
-
-pub async fn request_recovery_code(
-    State(ctx): State<Arc<dyn ControlCtx>>,
-    Query(RequestRecoveryCodeParams { link, email, identity }): Query<RequestRecoveryCodeParams>,
-) -> axum::response::Result<impl IntoResponse> {
-    let identity = Identity::from(identity);
-    let Some(sendgrid) = ctx.sendgrid_controller() else {
-        log::error!("A recovery code was requested, but SendGrid is disabled.");
-        return Err((StatusCode::INTERNAL_SERVER_ERROR, "SendGrid is disabled.").into());
-    };
-
-    if !ctx
-        .control_db()
-        .get_identities_for_email(email.as_str())
-        .map_err(log_and_500)?
-        .iter()
-        .any(|a| a.identity == identity)
-    {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "Email is not associated with the provided identity.",
-        )
-            .into());
-    }
-
-    let code = rand::thread_rng().gen_range(0..=999999);
-    let code = format!("{code:06}");
-    let recovery_code = RecoveryCode {
-        code: code.clone(),
-        generation_time: Utc::now(),
-        identity: identity.to_hex(),
-    };
-    ctx.control_db()
-        .spacetime_insert_recovery_code(email.as_str(), recovery_code)
-        .await
-        .map_err(log_and_500)?;
-
-    sendgrid
-        .send_recovery_email(email.as_str(), code.as_str(), &identity.to_hex(), link)
-        .await
-        .map_err(log_and_500)?;
-    Ok(())
-}
-
-#[derive(Deserialize)]
-pub struct ConfirmRecoveryCodeParams {
-    pub email: String,
-    pub identity: IdentityForUrl,
-    pub code: String,
-}
-
-/// Note: We should be slightly more security conscious about this function because
-///  we are providing a login token to the user initiating the request. We want to make
-///  sure there aren't any logical issues in here that would allow a user to request a token
-///  for an identity that they don't have authority over.
-pub async fn confirm_recovery_code(
-    State(ctx): State<Arc<dyn ControlCtx>>,
-    Query(ConfirmRecoveryCodeParams { email, identity, code }): Query<ConfirmRecoveryCodeParams>,
-) -> axum::response::Result<impl IntoResponse> {
-    let identity = Identity::from(identity);
-    let recovery_code = ctx
-        .control_db()
-        .spacetime_get_recovery_code(email.as_str(), code.as_str())
-        .await
-        .map_err(log_and_500)?
-        .ok_or((StatusCode::BAD_REQUEST, "Recovery code not found."))?;
-
-    let duration = Utc::now() - recovery_code.generation_time;
-    if duration.num_seconds() > 60 * 10 {
-        return Err((StatusCode::BAD_REQUEST, "Recovery code expired.").into());
-    }
-
-    // Make sure the identity provided by the request matches the recovery code registration
-    if recovery_code.identity != identity.to_hex() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "Recovery code doesn't match the provided identity.",
-        )
-            .into());
-    }
-
-    if !ctx
-        .control_db()
-        .get_identities_for_email(email.as_str())
-        .map_err(log_and_500)?
-        .iter()
-        .any(|a| a.identity == identity)
-    {
-        // This can happen if someone changes their associated email during a recovery request.
-        return Err((StatusCode::BAD_REQUEST, "No identity associated with that email.").into());
-    }
-
-    // Recovery code is verified, return the identity and token to the user
-    let token = encode_token(ctx.private_key(), identity).map_err(log_and_500)?;
-    let result = RecoveryCodeResponse {
-        identity: identity.to_hex(),
-        token,
-    };
-
-    Ok(axum::Json(result))
-}
-
-async fn control_ctx_find_database(ctx: &dyn ControlCtx, address: &Address) -> Result<Option<Database>, StatusCode> {
-    ctx.control_db()
-        .get_database_by_address(address)
-        .await
-        .map_err(log_and_500)
 }
 
 #[derive(Deserialize)]
@@ -757,239 +577,161 @@ pub struct PublishDatabaseParams {}
 
 #[derive(Deserialize)]
 pub struct PublishDatabaseQueryParams {
-    host_type: Option<String>,
     #[serde(default)]
     clear: bool,
-    name_or_address: Option<NameOrAddress>,
-    trace_log: Option<bool>,
-    #[serde(default)]
-    register_tld: bool,
+    name_or_identity: Option<NameOrIdentity>,
 }
 
-#[cfg(not(feature = "tracelogging"))]
-fn should_trace(_trace_log: Option<bool>) -> bool {
-    false
+impl PublishDatabaseQueryParams {
+    pub fn name_or_address(&self) -> Option<&NameOrIdentity> {
+        self.name_or_identity.as_ref()
+    }
 }
 
-#[cfg(feature = "tracelogging")]
-fn should_trace(trace_log: Option<bool>) -> bool {
-    trace_log.unwrap_or(false)
-}
-
-pub async fn publish(
-    State(ctx): State<Arc<dyn ControlCtx>>,
+pub async fn publish<S: NodeDelegate + ControlStateDelegate>(
+    State(ctx): State<S>,
     Path(PublishDatabaseParams {}): Path<PublishDatabaseParams>,
     Query(query_params): Query<PublishDatabaseQueryParams>,
-    auth: SpacetimeAuthHeader,
+    Extension(auth): Extension<SpacetimeAuth>,
     body: Bytes,
 ) -> axum::response::Result<axum::Json<PublishResult>> {
     let PublishDatabaseQueryParams {
-        name_or_address,
-        host_type,
+        name_or_identity,
         clear,
-        trace_log,
-        register_tld,
     } = query_params;
 
     // You should not be able to publish to a database that you do not own
     // so, unless you are the owner, this will fail.
-    let auth = auth_or_bad_request(auth)?;
 
-    let specified_address = matches!(name_or_address, Some(NameOrAddress::Address(_)));
-
-    // Parse the address or convert the name to a usable address
-    let db_address = if let Some(name_or_address) = name_or_address.clone() {
-        match name_or_address.try_resolve(&*ctx).await? {
+    let (database_identity, db_name) = match name_or_identity {
+        Some(noa) => match noa.try_resolve(&ctx).await? {
             Ok(resolved) => resolved.into(),
             Err(domain) => {
-                // Client specified a name which doesn't yet exist
-                // Create a new DNS record and a new address to assign to it
-                let address = ctx.control_db().alloc_spacetime_address().await.map_err(log_and_500)?;
-                let result = ctx
-                    .control_db()
-                    .spacetime_insert_domain(&address, domain, auth.identity, register_tld)
+                // `name_or_address` was a `NameOrAddress::Name`, but no record
+                // exists yet. Create it now with a fresh address.
+                let database_auth = SpacetimeAuth::alloc(&ctx).await?;
+                let database_identity = database_auth.identity;
+                ctx.create_dns_record(&auth.identity, &domain, &database_identity)
                     .await
                     .map_err(log_and_500)?;
-                match result {
-                    InsertDomainResult::Success { .. } => {}
-                    InsertDomainResult::TldNotRegistered { domain } => {
-                        return Ok(axum::Json(PublishResult::TldNotRegistered { domain }))
-                    }
-                    InsertDomainResult::PermissionDenied { domain } => {
-                        return Ok(axum::Json(PublishResult::PermissionDenied { domain }))
-                    }
-                }
-
-                address
+                (database_identity, Some(domain))
             }
+        },
+        None => {
+            let database_auth = SpacetimeAuth::alloc(&ctx).await?;
+            let database_identity = database_auth.identity;
+            (database_identity, None)
         }
-    } else {
-        // No domain or address was specified, create a new one
-        ctx.control_db().alloc_spacetime_address().await.map_err(log_and_500)?
     };
 
-    log::trace!("Publishing to the address: {}", db_address.to_hex());
+    log::trace!("Publishing to the address: {}", database_identity.to_hex());
 
-    let host_type = match host_type {
-        None => HostType::Wasmer,
-        Some(ht) => ht
-            .parse()
-            .map_err(|_| (StatusCode::BAD_REQUEST, format!("unknown host type {ht}")))?,
-    };
+    let op = {
+        let exists = ctx
+            .get_database_by_identity(&database_identity)
+            .map_err(log_and_500)?
+            .is_some();
 
-    let program_bytes_addr = ctx.object_db().insert_object(body.into()).unwrap();
-
-    let num_replicas = 1;
-
-    let trace_log = should_trace(trace_log);
-
-    let op = match control_ctx_find_database(&*ctx, &db_address).await? {
-        Some(db) => {
-            if db.identity != auth.identity {
-                return Err((StatusCode::BAD_REQUEST, "Identity does not own this database.").into());
-            }
-
-            if clear {
-                ctx.insert_database(
-                    &db_address,
-                    &auth.identity,
-                    &program_bytes_addr,
-                    host_type,
-                    num_replicas,
-                    clear,
-                    trace_log,
-                )
+        if clear && exists {
+            ctx.delete_database(&auth.identity, &database_identity)
                 .await
                 .map_err(log_and_500)?;
-                PublishOp::Created
-            } else {
-                let res = ctx
-                    .update_database(&db_address, &program_bytes_addr, num_replicas)
-                    .await
-                    .map_err(log_and_500)?;
-                if let Some(res) = res {
-                    let success = match res {
-                        Ok(success) => success,
-                        Err(e) => {
-                            return Err((StatusCode::BAD_REQUEST, format!("Database update rejected: {e}")).into());
-                        }
-                    };
-                    if let UpdateDatabaseSuccess {
-                        update_result: Some(update_result),
-                        migrate_results: _,
-                    } = success
-                    {
-                        match reducer_outcome_response(&auth.identity, "update", update_result.outcome) {
-                            (StatusCode::OK, _) => {}
-                            (status, body) => return Err((status, body).into()),
-                        }
-                    }
-                }
+        }
 
-                log::debug!("Updated database {}", db_address.to_hex());
-                PublishOp::Updated
-            }
-        }
-        None if specified_address => {
-            return Err((
-                StatusCode::NOT_FOUND,
-                format!("Failed to find database at address: {}", db_address.to_hex()),
-            )
-                .into())
-        }
-        None => {
-            ctx.insert_database(
-                &db_address,
-                &auth.identity,
-                &program_bytes_addr,
-                host_type,
-                num_replicas,
-                false,
-                trace_log,
-            )
-            .await
-            .map_err(log_and_500)?;
+        if exists {
+            PublishOp::Updated
+        } else {
             PublishOp::Created
         }
     };
 
-    let response = PublishResult::Success {
-        domain: name_or_address.and_then(|noa| match noa {
-            NameOrAddress::Address(_) => None,
-            NameOrAddress::Name(name) => Some(name),
-        }),
-        address: db_address.to_hex(),
-        op,
-    };
+    let maybe_updated = ctx
+        .publish_database(
+            &auth.identity,
+            DatabaseDef {
+                database_identity,
+                program_bytes: body.into(),
+                num_replicas: 1,
+                host_type: HostType::Wasm,
+            },
+        )
+        .await
+        .map_err(log_and_500)?;
 
-    //TODO(tyler): Eventually we want it to be possible to publish a database
-    // which no one has the credentials to. In that case we wouldn't want to
-    // return a token.
-    Ok(axum::Json(response))
+    if let Some(updated) = maybe_updated {
+        match updated {
+            UpdateDatabaseResult::AutoMigrateError(errs) => {
+                return Err((StatusCode::BAD_REQUEST, format!("Database update rejected: {errs}")).into());
+            }
+            UpdateDatabaseResult::ErrorExecutingMigration(err) => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!("Failed to create or update the database: {err}"),
+                )
+                    .into());
+            }
+            UpdateDatabaseResult::NoUpdateNeeded | UpdateDatabaseResult::UpdatePerformed => {}
+        }
+    }
+
+    Ok(axum::Json(PublishResult::Success {
+        domain: db_name.as_ref().map(ToString::to_string),
+        database_identity,
+        op,
+    }))
 }
 
 #[derive(Deserialize)]
 pub struct DeleteDatabaseParams {
-    address: Address,
+    database_identity: IdentityForUrl,
 }
 
-pub async fn delete_database(
-    State(ctx): State<Arc<dyn ControlCtx>>,
-    Path(DeleteDatabaseParams { address }): Path<DeleteDatabaseParams>,
-    auth: SpacetimeAuthHeader,
+pub async fn delete_database<S: ControlStateDelegate>(
+    State(ctx): State<S>,
+    Path(DeleteDatabaseParams {
+        database_identity: address,
+    }): Path<DeleteDatabaseParams>,
+    Extension(auth): Extension<SpacetimeAuth>,
 ) -> axum::response::Result<impl IntoResponse> {
-    let auth = auth_or_bad_request(auth)?;
+    let address = Identity::from(address);
 
-    match control_ctx_find_database(&*ctx, &address).await? {
-        Some(db) => {
-            if db.identity != auth.identity {
-                Err((StatusCode::BAD_REQUEST, "Identity does not own this database.").into())
-            } else {
-                ctx.delete_database(&address)
-                    .await
-                    .map_err(log_and_500)
-                    .map_err(Into::into)
-            }
-        }
-        None => Ok(()),
-    }
+    ctx.delete_database(&auth.identity, &address)
+        .await
+        .map_err(log_and_500)?;
+
+    Ok(())
 }
 
 #[derive(Deserialize)]
 pub struct SetNameQueryParams {
     domain: String,
-    address: Address,
-    #[serde(default)]
-    register_tld: bool,
+    database_identity: IdentityForUrl,
 }
 
-pub async fn set_name(
-    State(ctx): State<Arc<dyn ControlCtx>>,
+pub async fn set_name<S: ControlStateDelegate>(
+    State(ctx): State<S>,
     Query(SetNameQueryParams {
         domain,
-        address,
-        register_tld,
+        database_identity,
     }): Query<SetNameQueryParams>,
-    auth: SpacetimeAuthHeader,
+    Extension(auth): Extension<SpacetimeAuth>,
 ) -> axum::response::Result<impl IntoResponse> {
-    let auth = auth_or_bad_request(auth)?;
+    let database_identity = Identity::from(database_identity);
 
     let database = ctx
-        .control_db()
-        .get_database_by_address(&address)
-        .await
+        .get_database_by_identity(&database_identity)
         .map_err(log_and_500)?
         .ok_or((StatusCode::NOT_FOUND, "No such database."))?;
 
-    if database.identity != auth.identity {
-        return Err((StatusCode::BAD_REQUEST, "Identity does not own database.").into());
+    if database.owner_identity != auth.identity {
+        return Err((StatusCode::UNAUTHORIZED, "Identity does not own database.").into());
     }
 
-    let domain = domain.parse().map_err(DomainParsingRejection)?;
+    let domain = domain.parse().map_err(|_| DomainParsingRejection)?;
     let response = ctx
-        .control_db()
-        .spacetime_insert_domain(&address, domain, auth.identity, register_tld)
+        .create_dns_record(&auth.identity, &domain, &database_identity)
         .await
+        // TODO: better error code handling
         .map_err(log_and_500)?;
 
     Ok(axum::Json(response))
@@ -997,43 +739,41 @@ pub async fn set_name(
 
 /// This API call is just designed to allow clients to determine whether or not they can
 /// establish a connection to SpacetimeDB. This API call doesn't actually do anything.
-pub async fn ping(
-    State(_ctx): State<Arc<dyn ControlCtx>>,
-    _auth: SpacetimeAuthHeader,
-) -> axum::response::Result<impl IntoResponse> {
+pub async fn ping<S>(State(_ctx): State<S>, _auth: SpacetimeAuthHeader) -> axum::response::Result<impl IntoResponse> {
     Ok(())
 }
 
-pub fn control_routes<S>() -> axum::Router<S>
+pub fn control_routes<S>(ctx: S) -> axum::Router<S>
 where
-    S: ControlNodeDelegate + Clone + 'static,
-    Arc<dyn ControlCtx>: FromRef<S>,
+    S: NodeDelegate + ControlStateDelegate + Clone + 'static,
 {
     use axum::routing::{get, post};
     axum::Router::new()
-        .route("/dns/:database_name", get(dns))
-        .route("/reverse_dns/:database_address", get(reverse_dns))
-        .route("/set_name", get(set_name))
-        .route("/ping", get(ping))
-        .route("/register_tld", get(register_tld))
-        .route("/request_recovery_code", get(request_recovery_code))
-        .route("/confirm_recovery_code", get(confirm_recovery_code))
-        .route("/publish", post(publish).layer(DefaultBodyLimit::disable()))
-        .route("/delete/:address", post(delete_database))
+        .route("/dns/:database_name", get(dns::<S>))
+        .route("/reverse_dns/:database_identity", get(reverse_dns::<S>))
+        .route("/set_name", get(set_name::<S>))
+        .route("/ping", get(ping::<S>))
+        .route("/register_tld", get(register_tld::<S>))
+        .route("/publish", post(publish::<S>).layer(DefaultBodyLimit::disable()))
+        .route("/delete/:database_identity", post(delete_database::<S>))
+        .route_layer(axum::middleware::from_fn_with_state(ctx, anon_auth_middleware::<S>))
 }
 
-pub fn worker_routes<S>() -> axum::Router<S>
+pub fn worker_routes<S>(ctx: S) -> axum::Router<S>
 where
-    S: ControlNodeDelegate + Clone + 'static,
-    Arc<dyn WorkerCtx>: FromRef<S>,
+    S: NodeDelegate + ControlStateDelegate + Clone + 'static,
 {
     use axum::routing::{get, post};
     axum::Router::new()
-        .route("/subscribe/:name_or_address", get(super::subscribe::handle_websocket))
-        .route("/call/:name_or_address/:reducer", post(call))
-        .route("/schema/:name_or_address/:entity_type/:entity", get(describe))
-        .route("/schema/:name_or_address", get(catalog))
-        .route("/info/:name_or_address", get(info))
-        .route("/logs/:name_or_address", get(logs))
-        .route("/sql/:name_or_address", post(sql))
+        .route(
+            "/subscribe/:name_or_identity",
+            get(super::subscribe::handle_websocket::<S>),
+        )
+        .route("/call/:name_or_identity/:reducer", post(call::<S>))
+        .route("/schema/:name_or_identity/:entity_type/:entity", get(describe::<S>))
+        .route("/schema/:name_or_identity", get(catalog::<S>))
+        .route("/info/:name_or_identity", get(info::<S>))
+        .route("/logs/:name_or_identity", get(logs::<S>))
+        .route("/sql/:name_or_identity", post(sql::<S>))
+        .route_layer(axum::middleware::from_fn_with_state(ctx, anon_auth_middleware::<S>))
 }

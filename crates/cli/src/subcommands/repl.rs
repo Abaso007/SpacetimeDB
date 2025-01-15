@@ -1,6 +1,8 @@
 use crate::api::{ClientApi, Connection};
 use crate::sql::run_sql;
 use colored::*;
+use dirs::home_dir;
+use std::env::temp_dir;
 
 use rustyline::completion::Completer;
 use rustyline::error::ReadlineError;
@@ -15,8 +17,8 @@ use syntect::highlighting::{Theme, ThemeSet};
 use syntect::parsing::{SyntaxDefinition, SyntaxSet, SyntaxSetBuilder};
 use syntect::util::LinesWithEndings;
 
-static SQL_SYNTAX: &str = include_str!("../../tools/sublime/SpaceTimeDbSQL.sublime-syntax");
-static SYNTAX_NAME: &str = "SQL (SpaceTimeDb)";
+static SQL_SYNTAX: &str = include_str!("../../tools/sublime/SpacetimeDBSQL.sublime-syntax");
+static SYNTAX_NAME: &str = "SQL (SpacetimeDB)";
 
 static AUTO_COMPLETE: &str = "\
 true
@@ -39,7 +41,8 @@ sort by
 pub async fn exec(con: Connection) -> Result<(), anyhow::Error> {
     let database = con.database.clone();
     let mut rl = Editor::<ReplHelper, DefaultHistory>::new().unwrap();
-    if rl.load_history(".history.txt").is_err() {
+    let history = home_dir().unwrap_or_else(temp_dir).join(".stdb.history.txt");
+    if rl.load_history(&history).is_err() {
         eprintln!("No previous history.");
     }
     rl.set_helper(Some(ReplHelper::new().unwrap()));
@@ -68,7 +71,7 @@ pub async fn exec(con: Connection) -> Result<(), anyhow::Error> {
                 sql => {
                     rl.add_history_entry(sql).ok();
 
-                    if let Err(err) = run_sql(api.sql(), sql).await {
+                    if let Err(err) = run_sql(api.sql(), sql, true).await {
                         eprintln!("{}", err.to_string().red())
                     }
                 }
@@ -84,7 +87,7 @@ pub async fn exec(con: Connection) -> Result<(), anyhow::Error> {
         }
     }
 
-    rl.save_history(".history.txt").ok();
+    rl.save_history(&history).ok();
 
     Ok(())
 }
@@ -141,10 +144,10 @@ impl Completer for ReplHelper {
         }
         name = name.chars().rev().collect();
 
-        let mut completions: Vec<_> = AUTO_COMPLETE.split('\n').map(str::to_string).collect();
-        completions = completions
-            .iter()
-            .filter_map(|it| it.starts_with(&name).then(|| it.clone()))
+        let completions: Vec<_> = AUTO_COMPLETE
+            .split('\n')
+            .filter(|it| it.starts_with(&name))
+            .map(str::to_owned)
             .collect();
 
         Ok((name_pos, completions))

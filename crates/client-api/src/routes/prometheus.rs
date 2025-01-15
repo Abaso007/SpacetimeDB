@@ -1,10 +1,8 @@
-use axum::extract::{FromRef, State};
+use crate::{log_and_500, ControlStateReadAccess};
+use axum::extract::State;
 use axum::response::IntoResponse;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::sync::Arc;
-
-use crate::{log_and_500, ControlCtx, ControlNodeDelegate};
+use spacetimedb_data_structures::map::HashMap;
 
 #[derive(Serialize, Deserialize)]
 struct SDConfig {
@@ -12,15 +10,19 @@ struct SDConfig {
     labels: HashMap<String, String>,
 }
 
-pub async fn get_sd_config(State(ctx): State<Arc<dyn ControlCtx>>) -> axum::response::Result<impl IntoResponse> {
+pub async fn get_sd_config<S: ControlStateReadAccess>(
+    State(ctx): State<S>,
+) -> axum::response::Result<impl IntoResponse> {
     // TODO(cloutiertyler): security
-    let nodes = ctx.control_db().get_nodes().await.map_err(log_and_500)?;
+    let nodes = ctx.get_nodes().map_err(log_and_500)?;
 
     let mut targets = Vec::new();
-    let labels = HashMap::new();
+    let labels = HashMap::default();
 
     for node in nodes {
-        targets.push(node.advertise_addr);
+        if let Some(addr) = node.advertise_addr {
+            targets.push(addr);
+        }
     }
 
     let sd_config = SDConfig { targets, labels };
@@ -30,9 +32,8 @@ pub async fn get_sd_config(State(ctx): State<Arc<dyn ControlCtx>>) -> axum::resp
 
 pub fn router<S>() -> axum::Router<S>
 where
-    S: ControlNodeDelegate + Clone + 'static,
-    Arc<dyn ControlCtx>: FromRef<S>,
+    S: ControlStateReadAccess + Clone + Send + Sync + 'static,
 {
     use axum::routing::get;
-    axum::Router::new().route("/sd_config", get(get_sd_config))
+    axum::Router::new().route("/sd_config", get(get_sd_config::<S>))
 }

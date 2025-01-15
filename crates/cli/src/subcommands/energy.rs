@@ -1,7 +1,9 @@
 // use clap::Arg;
-use clap::{value_parser, Arg, ArgMatches};
+use crate::common_args;
+use clap::ArgMatches;
 
 use crate::config::Config;
+use crate::util;
 
 pub fn cli() -> clap::Command {
     clap::Command::new("energy")
@@ -12,45 +14,24 @@ pub fn cli() -> clap::Command {
 }
 
 fn get_energy_subcommands() -> Vec<clap::Command> {
-    vec![
-        clap::Command::new("status")
-            .about("Show current energy balance for an identity")
-            .arg(
-                Arg::new("identity")
-                    .help("The identity to check the balance for")
-                    .long_help(
+    vec![clap::Command::new("balance")
+        .about("Show current energy balance for an identity")
+        .arg(
+            common_args::identity()
+                .help("The identity to check the balance for")
+                .long_help(
                     "The identity to check the balance for. If no identity is provided, the default one will be used.",
                 ),
-            ),
-        clap::Command::new("set-balance")
-            .about("Update the current budget balance for a database")
-            .arg(
-                Arg::new("balance")
-                    .required(true)
-                    .value_parser(value_parser!(i128))
-                    .help("The balance value to set"),
-            )
-            .arg(
-                Arg::new("identity")
-                    .help("The identity to set a balance for")
-                    .long_help(
-                        "The identity to set a balance for. If no identity is provided, the default one will be used.",
-                    ),
-            )
-            .arg(
-                Arg::new("quiet")
-                    .long("quiet")
-                    .short('q')
-                    .action(clap::ArgAction::SetTrue)
-                    .help("Runs command in silent mode"),
-            ),
-    ]
+        )
+        .arg(
+            common_args::server()
+                .help("The nickname, host name or URL of the server from which to request balance information"),
+        )]
 }
 
 async fn exec_subcommand(config: Config, cmd: &str, args: &ArgMatches) -> Result<(), anyhow::Error> {
     match cmd {
-        "status" => exec_status(config, args).await,
-        "set-balance" => exec_update_balance(config, args).await,
+        "balance" => exec_status(config, args).await,
         unknown => Err(anyhow::anyhow!("Invalid subcommand: {}", unknown)),
     }
 }
@@ -60,29 +41,19 @@ pub async fn exec(config: Config, args: &ArgMatches) -> Result<(), anyhow::Error
     exec_subcommand(config, cmd, subcommand_args).await
 }
 
-async fn exec_update_balance(config: Config, args: &ArgMatches) -> Result<(), anyhow::Error> {
-    // let project_name = args.value_of("project name").unwrap();
-    let hex_id = args.get_one::<String>("identity");
-    let balance = *args.get_one::<i128>("balance").unwrap();
-    let quiet = args.get_flag("quiet");
-
-    let hex_id = hex_id_or_default(hex_id, &config);
-    let res = set_balance(&reqwest::Client::new(), &config, hex_id, balance).await?;
-
-    if !quiet {
-        println!("{}", res.text().await?);
-    }
-
-    Ok(())
-}
-
 async fn exec_status(config: Config, args: &ArgMatches) -> Result<(), anyhow::Error> {
     // let project_name = args.value_of("project name").unwrap();
-    let hex_id = args.get_one::<String>("identity");
-    let hex_id = hex_id_or_default(hex_id, &config);
+    let identity = args.get_one::<String>("identity");
+    let server = args.get_one::<String>("server").map(|s| s.as_ref());
+    // TODO: We should remove the ability to call this for arbitrary users. At *least* remove it from the CLI.
+    let identity = if let Some(identity) = identity {
+        identity.clone()
+    } else {
+        util::decode_identity(&config)?
+    };
 
     let status = reqwest::Client::new()
-        .get(format!("{}/energy/{}", config.get_host_url(), hex_id))
+        .get(format!("{}/energy/{}", config.get_host_url(server)?, identity))
         .send()
         .await?
         .error_for_status()?
@@ -92,26 +63,4 @@ async fn exec_status(config: Config, args: &ArgMatches) -> Result<(), anyhow::Er
     println!("{}", status);
 
     Ok(())
-}
-
-fn hex_id_or_default<'a>(hex_id: Option<&'a String>, config: &'a Config) -> &'a String {
-    hex_id.unwrap_or_else(|| &config.get_default_identity_config().unwrap().identity)
-}
-
-pub(super) async fn set_balance(
-    client: &reqwest::Client,
-    config: &Config,
-    hex_identity: &str,
-    balance: i128,
-) -> anyhow::Result<reqwest::Response> {
-    // TODO: this really should be form data in POST body, not query string parameter, but gotham
-    // does not support that on the server side without an extension.
-    // see https://github.com/gotham-rs/gotham/issues/11
-    client
-        .post(format!("{}/energy/{}", config.get_host_url(), hex_identity))
-        .query(&[("balance", balance)])
-        .send()
-        .await?
-        .error_for_status()
-        .map_err(|e| e.into())
 }
