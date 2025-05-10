@@ -50,9 +50,25 @@ public interface IReadWrite<T>
 public readonly struct Enum<T> : IReadWrite<T>
     where T : struct, Enum
 {
+    private static readonly ulong NumVariants;
+
+    static Enum()
+    {
+        NumVariants = (ulong)Enum.GetValues(typeof(T)).Length;
+    }
+
     private static T Validate(T value)
     {
-        if (!Enum.IsDefined(typeof(T), value))
+        // Previously this was: `if (!Enum.IsDefined(typeof(T), value))`.
+        // This was quite expensive because:
+        //   1. It uses reflection
+        //   2. It allocates
+        //   3. It is called on each row when decoding
+        //
+        // However, enum values are guaranteed to be sequential and zero based.
+        // Hence we only ever need to do an upper bound check.
+        // See `SpacetimeDB.Type.ParseEnum` for the syntax analysis.
+        if (Convert.ToUInt64(value) >= NumVariants)
         {
             throw new ArgumentOutOfRangeException(
                 nameof(value),
@@ -387,8 +403,19 @@ public readonly struct Array<Element, ElementRW> : IReadWrite<Element[]>
     where ElementRW : IReadWrite<Element>, new()
 {
     private static readonly Enumerable<Element, ElementRW> enumerable = new();
+    private static readonly ElementRW elementRW = new();
 
-    public Element[] Read(BinaryReader reader) => enumerable.Read(reader).ToArray();
+    public Element[] Read(BinaryReader reader)
+    {
+        // Don't use Enumerable here: save an allocation and pre-allocate the output.
+        var count = reader.ReadInt32();
+        var result = new Element[count];
+        for (var i = 0; i < count; i++)
+        {
+            result[i] = elementRW.Read(reader);
+        }
+        return result;
+    }
 
     public void Write(BinaryWriter writer, Element[] value) => enumerable.Write(writer, value);
 
@@ -430,8 +457,19 @@ public readonly struct List<Element, ElementRW> : IReadWrite<List<Element>>
     where ElementRW : IReadWrite<Element>, new()
 {
     private static readonly Enumerable<Element, ElementRW> enumerable = new();
+    private static readonly ElementRW elementRW = new();
 
-    public List<Element> Read(BinaryReader reader) => enumerable.Read(reader).ToList();
+    public List<Element> Read(BinaryReader reader)
+    {
+        // Don't use Enumerable here: save an allocation and pre-allocate the output.
+        var count = reader.ReadInt32();
+        var result = new List<Element>(count);
+        for (var i = 0; i < count; i++)
+        {
+            result.Add(elementRW.Read(reader));
+        }
+        return result;
+    }
 
     public void Write(BinaryWriter writer, List<Element> value) => enumerable.Write(writer, value);
 
