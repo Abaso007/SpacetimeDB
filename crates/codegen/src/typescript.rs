@@ -16,6 +16,7 @@ use spacetimedb_schema::type_for_generate::{AlgebraicTypeDef, AlgebraicTypeUse, 
 
 use super::code_indenter::{CodeIndenter, Indenter};
 use super::Lang;
+use spacetimedb_lib::version::spacetimedb_lib_version;
 
 type Imports = BTreeSet<AlgebraicTypeRef>;
 
@@ -104,7 +105,7 @@ impl Lang for TypeScript {
 
         writeln!(
             out,
-            "import {{ EventContext, Reducer, RemoteReducers, RemoteTables }} from \".\";"
+            "import {{ type EventContext, type Reducer, RemoteReducers, RemoteTables }} from \".\";"
         );
 
         let table_name = table.name.deref();
@@ -355,6 +356,11 @@ removeOnUpdate = (cb: (ctx: EventContext, onRow: {row_type}, newRow: {row_type})
             out.dedent(1);
             writeln!(out, "}},");
         }
+        out.dedent(1);
+        writeln!(out, "}},");
+        writeln!(out, "versionInfo: {{");
+        out.indent(1);
+        writeln!(out, "cliVersion: \"{}\",", spacetimedb_lib_version());
         out.dedent(1);
         writeln!(out, "}},");
         writeln!(
@@ -630,16 +636,16 @@ fn print_spacetimedb_imports(out: &mut Indenter) {
         "DbConnectionBuilder",
         "TableCache",
         "BinaryWriter",
-        "CallReducerFlags",
-        "EventContextInterface",
-        "ReducerEventContextInterface",
-        "SubscriptionEventContextInterface",
-        "ErrorContextInterface",
+        "type CallReducerFlags",
+        "type EventContextInterface",
+        "type ReducerEventContextInterface",
+        "type SubscriptionEventContextInterface",
+        "type ErrorContextInterface",
         "SubscriptionBuilderImpl",
         "BinaryReader",
         "DbConnectionImpl",
-        "DbContext",
-        "Event",
+        "type DbContext",
+        "type Event",
         "deepEqual",
     ];
     types.sort();
