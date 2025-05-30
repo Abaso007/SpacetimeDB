@@ -5,7 +5,7 @@ use std::{
     mem,
 };
 
-use log::debug;
+use log::{debug, trace};
 use memmap2::MmapMut;
 use spacetimedb_paths::server::OffsetIndexFile;
 
@@ -115,6 +115,10 @@ impl<Key: Into<u64> + From<u64>> IndexFileMut<Key> {
         if low == 0 && key < low_key {
             return Err(IndexError::KeyNotFound);
         }
+        // If found key is 0, return `KeyNotFound`
+        if low_key == 0 {
+            return Err(IndexError::KeyNotFound);
+        }
 
         Ok((Key::from(low_key), low as u64))
     }
@@ -186,19 +190,32 @@ impl<Key: Into<u64> + From<u64>> IndexFileMut<Key> {
         self.inner.flush_async()
     }
 
-    /// Truncates the index file starting from the entry with a key greater than or equal to the given key.
+    /// Truncates the index file starting from the entry with a key greater than
+    /// or equal to the given key.
+    ///
+    /// If successful, `key` will no longer be in the index.
     pub(crate) fn truncate(&mut self, key: Key) -> Result<(), IndexError> {
         let key = key.into();
-        let (found_key, index) = self.find_index(Key::from(key))?;
+        let (found_key, index) = self
+            .find_index(Key::from(key))
+            .map(|(found, index)| (found.into(), index))?;
 
-        // If returned key is smalled than asked key, truncate from next entry
-        self.num_entries = if found_key.into() == key {
+        // If returned key is smaller than asked key, truncate from next entry
+        self.num_entries = if found_key == key {
             index as usize
         } else {
             index as usize + 1
         };
 
         let start = self.num_entries * ENTRY_SIZE;
+        trace!(
+            "truncate key={} found={} index={} num-entries={} start={}",
+            key,
+            found_key,
+            index,
+            self.num_entries,
+            start
+        );
 
         if start < self.inner.len() {
             self.inner[start..].fill(0);
@@ -334,6 +351,7 @@ mod tests {
     use std::path::Path;
 
     use super::*;
+    use pretty_assertions::assert_matches;
     use spacetimedb_paths::server::CommitLogDir;
     use spacetimedb_paths::FromPathUnchecked;
     use tempfile::TempDir;
@@ -403,6 +421,14 @@ mod tests {
         // key smaller than 1st entry should return error
         assert!(index.key_lookup(1).is_err());
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_empty_index_lookup_should_fail() -> Result<(), IndexError> {
+        let index = create_index_in(TempDir::new().unwrap().path(), 100)?;
+        assert_matches!(index.key_lookup(0), Err(IndexError::KeyNotFound));
+        assert_matches!(index.key_lookup(10), Err(IndexError::KeyNotFound));
         Ok(())
     }
 

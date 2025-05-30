@@ -12,9 +12,11 @@ use crate::identity::Identity;
 use crate::messages::control_db::Database;
 use crate::replica_context::ReplicaContext;
 use crate::sql::ast::SchemaViewer;
+use crate::sql::parser::RowLevelExpr;
+use crate::subscription::execute_plan;
 use crate::subscription::module_subscription_actor::ModuleSubscriptions;
 use crate::subscription::tx::DeltaTx;
-use crate::subscription::{execute_plan, record_exec_metrics};
+use crate::util::asyncify;
 use crate::util::lending_pool::{LendingPool, LentResource, PoolClosed};
 use crate::vm::check_row_limit;
 use crate::worker_metrics::WORKER_METRICS;
@@ -24,6 +26,7 @@ use derive_more::From;
 use futures::{Future, FutureExt};
 use indexmap::IndexSet;
 use itertools::Itertools;
+use prometheus::{Histogram, IntGauge};
 use spacetimedb_client_api_messages::websocket::{ByteListLen, Compression, OneOffTable, QueryUpdate, WebsocketFormat};
 use spacetimedb_data_structures::error_stream::ErrorStream;
 use spacetimedb_data_structures::map::{HashCollectionExt as _, IntMap};
@@ -38,6 +41,7 @@ use spacetimedb_sats::ProductValue;
 use spacetimedb_schema::auto_migrate::AutoMigrateError;
 use spacetimedb_schema::def::deserialize::ReducerArgsDeserializeSeed;
 use spacetimedb_schema::def::{ModuleDef, ReducerDef};
+use spacetimedb_schema::schema::{Schema, TableSchema};
 use spacetimedb_vm::relation::RelValue;
 use std::fmt;
 use std::sync::{Arc, Weak};
@@ -128,13 +132,17 @@ impl UpdatesRelValue<'_> {
         !(self.deletes.is_empty() && self.inserts.is_empty())
     }
 
-    pub fn encode<F: WebsocketFormat>(&self, compression: Compression) -> (F::QueryUpdate, u64, usize) {
+    pub fn encode<F: WebsocketFormat>(&self) -> (F::QueryUpdate, u64, usize) {
         let (deletes, nr_del) = F::encode_list(self.deletes.iter());
         let (inserts, nr_ins) = F::encode_list(self.inserts.iter());
         let num_rows = nr_del + nr_ins;
         let num_bytes = deletes.num_bytes() + inserts.num_bytes();
         let qu = QueryUpdate { deletes, inserts };
-        let cqu = F::into_query_update(qu, compression);
+        // We don't compress individual table updates.
+        // Previously we were, but the benefits, if any, were unclear.
+        // Note, each message is still compressed before being sent to clients,
+        // but we no longer have to hold a tx lock when doing so.
+        let cqu = F::into_query_update(qu, Compression::None);
         (cqu, num_rows, num_bytes)
     }
 }
@@ -192,6 +200,45 @@ pub struct ModuleInfo {
     pub log_tx: tokio::sync::broadcast::Sender<bytes::Bytes>,
     /// Subscriptions to this module.
     pub subscriptions: ModuleSubscriptions,
+    /// Metrics handles for this module.
+    pub metrics: ModuleMetrics,
+}
+
+#[derive(Debug)]
+pub struct ModuleMetrics {
+    pub connected_clients: IntGauge,
+    pub ws_clients_spawned: IntGauge,
+    pub ws_clients_aborted: IntGauge,
+    pub request_round_trip_subscribe: Histogram,
+    pub request_round_trip_unsubscribe: Histogram,
+    pub request_round_trip_sql: Histogram,
+}
+
+impl ModuleMetrics {
+    fn new(db: &Identity) -> Self {
+        let connected_clients = WORKER_METRICS.connected_clients.with_label_values(db);
+        let ws_clients_spawned = WORKER_METRICS.ws_clients_spawned.with_label_values(db);
+        let ws_clients_aborted = WORKER_METRICS.ws_clients_aborted.with_label_values(db);
+        let request_round_trip_subscribe =
+            WORKER_METRICS
+                .request_round_trip
+                .with_label_values(&WorkloadType::Subscribe, db, "");
+        let request_round_trip_unsubscribe =
+            WORKER_METRICS
+                .request_round_trip
+                .with_label_values(&WorkloadType::Unsubscribe, db, "");
+        let request_round_trip_sql = WORKER_METRICS
+            .request_round_trip
+            .with_label_values(&WorkloadType::Sql, db, "");
+        Self {
+            connected_clients,
+            ws_clients_spawned,
+            ws_clients_aborted,
+            request_round_trip_subscribe,
+            request_round_trip_unsubscribe,
+            request_round_trip_sql,
+        }
+    }
 }
 
 impl ModuleInfo {
@@ -205,6 +252,7 @@ impl ModuleInfo {
         log_tx: tokio::sync::broadcast::Sender<bytes::Bytes>,
         subscriptions: ModuleSubscriptions,
     ) -> Arc<Self> {
+        let metrics = ModuleMetrics::new(&database_identity);
         Arc::new(ModuleInfo {
             module_def,
             owner_identity,
@@ -212,6 +260,7 @@ impl ModuleInfo {
             module_hash,
             log_tx,
             subscriptions,
+            metrics,
         })
     }
 }
@@ -258,9 +307,6 @@ pub trait Module: Send + Sync + 'static {
 pub trait ModuleInstance: Send + 'static {
     fn trapped(&self) -> bool;
 
-    /// If the module instance's replica_ctx is uninitialized, initialize it.
-    fn init_database(&mut self, program: Program) -> anyhow::Result<Option<ReducerCallResult>>;
-
     /// Update the module instance's database to match the schema of the module instance.
     fn update_database(
         &mut self,
@@ -269,6 +315,81 @@ pub trait ModuleInstance: Send + 'static {
     ) -> anyhow::Result<UpdateDatabaseResult>;
 
     fn call_reducer(&mut self, tx: Option<MutTxId>, params: CallReducerParams) -> ReducerCallResult;
+}
+
+/// If the module instance's replica_ctx is uninitialized, initialize it.
+fn init_database(
+    replica_ctx: &ReplicaContext,
+    module_def: &ModuleDef,
+    inst: &mut dyn ModuleInstance,
+    program: Program,
+) -> anyhow::Result<Option<ReducerCallResult>> {
+    log::debug!("init database");
+    let timestamp = Timestamp::now();
+    let stdb = &*replica_ctx.relational_db;
+    let logger = replica_ctx.logger.system_logger();
+
+    let tx = stdb.begin_mut_tx(IsolationLevel::Serializable, Workload::Internal);
+    let auth_ctx = AuthCtx::for_current(replica_ctx.database.owner_identity);
+    let (tx, ()) = stdb
+        .with_auto_rollback(tx, |tx| {
+            let mut table_defs: Vec<_> = module_def.tables().collect();
+            table_defs.sort_by(|a, b| a.name.cmp(&b.name));
+
+            for def in table_defs {
+                let table_name = &def.name;
+                logger.info(&format!("Creating table `{table_name}`"));
+                let schema = TableSchema::from_module_def(module_def, def, (), TableId::SENTINEL);
+                stdb.create_table(tx, schema)
+                    .with_context(|| format!("failed to create table {table_name}"))?;
+            }
+            // Insert the late-bound row-level security expressions.
+            for rls in module_def.row_level_security() {
+                logger.info(&format!("Creating row level security `{}`", rls.sql));
+
+                let rls = RowLevelExpr::build_row_level_expr(tx, &auth_ctx, rls)
+                    .with_context(|| format!("failed to create row-level security: `{}`", rls.sql))?;
+                let table_id = rls.def.table_id;
+                let sql = rls.def.sql.clone();
+                stdb.create_row_level_security(tx, rls.def)
+                    .with_context(|| format!("failed to create row-level security for table `{table_id}`: `{sql}`",))?;
+            }
+
+            stdb.set_initialized(tx, replica_ctx.host_type, program)?;
+
+            anyhow::Ok(())
+        })
+        .inspect_err(|e| log::error!("{e:?}"))?;
+
+    let rcr = match module_def.lifecycle_reducer(Lifecycle::Init) {
+        None => {
+            if let Some((tx_data, tx_metrics, reducer)) = stdb.commit_tx(tx)? {
+                stdb.report(&reducer, &tx_metrics, Some(&tx_data));
+            }
+            None
+        }
+
+        Some((reducer_id, _)) => {
+            logger.info("Invoking `init` reducer");
+            let caller_identity = replica_ctx.database.owner_identity;
+            Some(inst.call_reducer(
+                Some(tx),
+                CallReducerParams {
+                    timestamp,
+                    caller_identity,
+                    caller_connection_id: ConnectionId::ZERO,
+                    client: None,
+                    request_id: None,
+                    timer: None,
+                    reducer_id,
+                    args: ArgsTuple::nullary(),
+                },
+            ))
+        }
+    };
+
+    logger.info("Database initialized");
+    Ok(rcr)
 }
 
 pub struct CallReducerParams {
@@ -300,11 +421,6 @@ impl<T: Module> AutoReplacingModuleInstance<T> {
 impl<T: Module> ModuleInstance for AutoReplacingModuleInstance<T> {
     fn trapped(&self) -> bool {
         self.inst.trapped()
-    }
-    fn init_database(&mut self, program: Program) -> anyhow::Result<Option<ReducerCallResult>> {
-        let ret = self.inst.init_database(program);
-        self.check_trap();
-        ret
     }
     fn update_database(
         &mut self,
@@ -516,25 +632,27 @@ impl ModuleHost {
             self.inner.get_instance(self.info.database_identity).await?
         };
 
-        // Spawning a task allows to catch panics without proving to the
-        // compiler that `dyn ModuleInstance` is unwind safe.
+        // Operations on module instances (e.g. calling reducers) is blocking,
+        // partially because the computation can potentialyl take a long time
+        // and partially because interacting with the database requires taking
+        // a blocking lock. So, we run `f` inside of `asyncify()`, which runs
+        // the provided closure in a tokio blocking task, and bubbles up any
+        // panic that may occur.
+
         // If a reducer call panics, we **must** ensure to call `self.on_panic`
         // so that the module is discarded by the host controller.
-        let result = tokio::spawn(async move { f(&mut *inst) }).await.unwrap_or_else(|e| {
+        scopeguard::defer_on_unwind!({
             log::warn!("reducer {reducer} panicked");
             (self.on_panic)();
-            std::panic::resume_unwind(e.into_panic());
         });
+        let result = asyncify(move || f(&mut *inst)).await;
         Ok(result)
     }
 
     pub async fn disconnect_client(&self, client_id: ClientActorId) {
         log::trace!("disconnecting client {}", client_id);
         let this = self.clone();
-        let _ = tokio::task::spawn_blocking(move || {
-            this.subscriptions().remove_subscriber(client_id);
-        })
-        .await;
+        asyncify(move || this.subscriptions().remove_subscriber(client_id)).await;
         // ignore NoSuchModule; if the module's already closed, that's fine
         if let Err(e) = self
             .call_identity_disconnected(client_id.identity, client_id.connection_id)
@@ -618,18 +736,21 @@ impl ModuleHost {
                 timestamp: Timestamp::now(),
                 arg_bsatn: Bytes::new(),
             });
-            self.inner
-                .replica_ctx()
-                .relational_db
-                .with_auto_commit(workload, |mut_tx| {
-                    mut_tx.insert_st_client(caller_identity, caller_connection_id)
+
+            let stdb = self.inner.replica_ctx().relational_db.clone();
+            asyncify(move || {
+                stdb.with_auto_commit(workload, |mut_tx| {
+                    mut_tx
+                        .insert_st_client(caller_identity, caller_connection_id)
+                        .map_err(DBError::from)
                 })
-                .inspect_err(|e| {
-                    log::error!(
-                        "`call_identity_connected`: fallback transaction to insert into `st_client` failed: {e:#?}"
-                    );
-                })
-                .map_err(Into::into)
+            })
+            .await
+            .inspect_err(|e| {
+                log::error!("`call_identity_connected`: fallback transaction to insert into `st_client` failed: {e:#?}")
+            })
+            .map_err(DBError::from)
+            .map_err(Into::into)
         }
     }
 
@@ -656,7 +777,7 @@ impl ModuleHost {
         let reducer_lookup = self.info.module_def.lifecycle_reducer(Lifecycle::OnDisconnect);
 
         // A fallback transaction that deletes the client from `st_client`.
-        let fallback = || {
+        let fallback = || async {
             let reducer_name = reducer_lookup
                 .as_ref()
                 .map(|(_, def)| &*def.name)
@@ -669,24 +790,26 @@ impl ModuleHost {
                 timestamp: Timestamp::now(),
                 arg_bsatn: Bytes::new(),
             });
-            self.inner
-                .replica_ctx()
-                .relational_db
-                .with_auto_commit(workload, |mut_tx| {
-                    mut_tx.delete_st_client(caller_identity, caller_connection_id)
+            let stdb = self.inner.replica_ctx().relational_db.clone();
+            let database_identity = self.info.database_identity;
+            asyncify(move || {
+                stdb.with_auto_commit(workload, |mut_tx| {
+                    mut_tx
+                        .delete_st_client(caller_identity, caller_connection_id, database_identity)
+                        .map_err(DBError::from)
                 })
-                .inspect_err(|e| {
-                    log::error!(
-                        "`call_identity_disconnected`: fallback transaction to delete from `st_client` failed: {e}"
-                    );
-                })
-                .map_err(|err| {
-                    InvalidReducerArguments {
-                        err: err.into(),
-                        reducer: reducer_name.into(),
-                    }
-                    .into()
-                })
+            })
+            .await
+            .map_err(|err| {
+                log::error!(
+                    "`call_identity_disconnected`: fallback transaction to delete from `st_client` failed: {err}"
+                );
+                InvalidReducerArguments {
+                    err: err.into(),
+                    reducer: reducer_name.into(),
+                }
+                .into()
+            })
         };
 
         if let Some((reducer_id, reducer_def)) = reducer_lookup {
@@ -716,12 +839,12 @@ impl ModuleHost {
             match result {
                 Err(e) => {
                     log::error!("call_reducer_inner of client_disconnected failed: {e:#?}");
-                    fallback()
+                    fallback().await
                 }
                 Ok(ReducerCallResult {
                     outcome: ReducerOutcome::Failed(_) | ReducerOutcome::BudgetExceeded,
                     ..
-                }) => fallback(),
+                }) => fallback().await,
 
                 // If it succeeded, as mentioend above, `st_client` is already updated.
                 Ok(ReducerCallResult {
@@ -732,7 +855,7 @@ impl ModuleHost {
         } else {
             // The module doesn't define a `client_disconnected` reducer.
             // Commit a transaction to update `st_clients`.
-            fallback()
+            fallback().await
         }
     }
 
@@ -875,9 +998,13 @@ impl ModuleHost {
     }
 
     pub async fn init_database(&self, program: Program) -> Result<Option<ReducerCallResult>, InitDatabaseError> {
-        self.call("<init_database>", move |inst| inst.init_database(program))
-            .await?
-            .map_err(InitDatabaseError::Other)
+        let replica_ctx = self.inner.replica_ctx().clone();
+        let info = self.info.clone();
+        self.call("<init_database>", move |inst| {
+            init_database(&replica_ctx, &info.module_def, inst, program)
+        })
+        .await?
+        .map_err(InitDatabaseError::Other)
     }
 
     pub async fn update_database(
@@ -965,7 +1092,7 @@ impl ModuleHost {
                 .context("One-off queries are not allowed to modify the database")
         })?;
 
-        record_exec_metrics(&WorkloadType::Sql, &db.database_identity(), metrics);
+        db.exec_counters_for(WorkloadType::Sql).record(&metrics);
 
         Ok(rows)
     }
