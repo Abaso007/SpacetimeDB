@@ -1000,7 +1000,7 @@ impl TryFrom<__ws::DatabaseUpdate<__ws::BsatnFormat>> for DbUpdate {
             for table in iter_tables(module) {
                 writeln!(
                     out,
-                    "{:?} => db_update.{} = {}::parse_table_update(table_update)?,",
+                    "{:?} => db_update.{}.append({}::parse_table_update(table_update)?),",
                     table.name.deref(),
                     table_method_name(&table.name),
                     table_module_name(&table.name),
@@ -1462,7 +1462,7 @@ impl<Ctx: __sdk::DbContext<
 ///
 /// If `event_type` is `Some`, `event_type_doc_link` should be as well.
 /// It should be a rustdoc-formatted link (including square brackets and all) to the `event_type`.
-/// This may differ (in the `strcmp` sense) from `event_type` because it should not inlcude generic parameters.
+/// This may differ (in the `strcmp` sense) from `event_type` because it should not include generic parameters.
 fn define_event_context(
     out: &mut Indenter,
     struct_and_trait_name: &str,
